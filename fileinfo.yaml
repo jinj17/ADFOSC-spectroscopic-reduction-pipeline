@@ -1,0 +1,30 @@
+# input pars
+
+workdir: "/disk1/ADFOSC_pp/RED_Spec/RED_CLAGN/20250407/P45"
+
+bias_pattern: "bias*fit"
+
+continuum_lamp: "Lamp3*fit"
+
+arc_lamp:
+  pattern: "lamp1*fit"
+  name: "HgAr.dat"
+
+standard_star:
+  pattern: "bd33d2642*fit"
+  name: "bd33d2642"
+  dispersion: "510"
+  combine: "mean"
+
+science_obj:
+  pattern: "1606+3324*fit"
+  name: "1606+3324"
+  dispersion: "500"
+  xlim: "1500"
+  combine: "mean"
+
+slit: '1.5"'
+grism: '676R-420gr/mm'
+trim : "True"
+spatial_axis: "0"
+

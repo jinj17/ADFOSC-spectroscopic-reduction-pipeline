@@ -1,0 +1,34 @@
+# Example reduction config for the ADFOSC pipeline.
+# Copy this file, rename it (e.g. fileinfo.yaml), and point `workdir`
+# at your own data directory before running the GUI or a script.
+
+# NOTE: the original version of this file had workdir hardcoded to a
+# personal path (/opt/test_spec_code/). Replace the path below with
+# wherever your raw FITS frames live.
+workdir: "./data/"
+
+bias_pattern: "bias*fit"
+
+continuum_lamp: "Lamp3*arc*fit"
+
+arc_lamp:
+  pattern: "lamp*fit"
+  name: "HgAr_neon.dat"   # must exist under src/specred/resources/arc/
+
+standard_star:
+  pattern: "Feige66*fit"
+  name: "Feige66"          # must have a matching table under src/specred/resources/onedstar/
+  dispersion: "485"
+  combine: "mean"
+
+science_obj:
+  pattern: "1101+1102*fit"
+  name: "1101+1102"
+  dispersion: "465"
+  xlim: "1500"
+  combine: "mean"
+
+slit: '1.5"'
+grism: '676R-420gr/mm'
+trim: "True"
+spatial_axis: "0"
