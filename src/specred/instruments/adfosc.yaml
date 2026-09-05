@@ -1,0 +1,59 @@
+# Instrument configuration for ADFOSC (Devasthal Optical Telescope).
+#
+# These values were previously hardcoded inside readfile_v2.py (trim box)
+# and inside the GUI's InteractiveWavelengthDialog (slit/grism -> initial
+# wavelength-solution guess). Pulling them out here means:
+#   - a different instrument/telescope can be supported by adding a new
+#     YAML file in this folder, with no code changes
+#   - the numbers are visible and documented instead of buried in code
+
+name: "ADFOSC"
+
+# CCD trim box applied to every raw frame (bias/flat/science/std/lamp)
+# when `trim: true` is set in the reduction config.
+trim_box:
+  cx: 0      # xmin
+  cy: 2030   # xmax
+  h: 550     # ymin
+  w: 1640    # ymax
+
+# Initial guess for the linear wavelength solution (offset + pixel*dispersion),
+# keyed by (slit, grism). Used to seed the interactive wavelength-calibration
+# dialog; the user still fine-tunes offset/dispersion with the sliders.
+wavelength_solution_guess:
+  - slit: '1"'
+    grism: '676R-420gr/mm'
+    dispersion: -3.38
+    offset: 6300
+  - slit: '1"'
+    grism: '132R-600gr/mm'
+    dispersion: -3.00
+    offset: 6326
+  - slit: '1"'
+    grism: '770R-300gr/mm'
+    dispersion: -7.00
+    offset: 6400
+  - slit: '1.5"'
+    grism: '676R-420gr/mm'
+    dispersion: -3.355
+    offset: 6305
+  - slit: '1.5"'
+    grism: '132R-600gr/mm'
+    dispersion: -2.27
+    offset: 5800
+  - slit: '1.5"'
+    grism: '770R-300gr/mm'
+    dispersion: -7.00
+    offset: 6500
+  - slit: '2"'
+    grism: '676R-420gr/mm'
+    dispersion: -3.35
+    offset: 6326
+  - slit: '2"'
+    grism: '132R-600gr/mm'
+    dispersion: -2.27
+    offset: 5800
+  - slit: '2"'
+    grism: '770R-300gr/mm'
+    dispersion: -7.00
+    offset: 6500
