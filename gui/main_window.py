@@ -362,12 +362,28 @@ class SpectroscopicReductionGUI(QMainWindow):
         menu.addAction('Open YAML configuration…', self.select_yaml_file)
 
     def show_about(self):
-        QMessageBox.about(self, 'About ADFOSC Spectroscopic Reduction',
-            '<h3>ADFOSC Spectroscopic Reduction Pipeline</h3>'
-            '<p>GUI wrapper for bias/flat reduction, spectral extraction, '
-            'arc wavelength calibration, combination, and flux calibration.</p>'
-            '<p>Built with Python, PyQt5 and Matplotlib. '
-            'The reduction algorithms are provided by the local SCRIPTS directory.</p>')
+        QMessageBox.about(
+            self, 'About ADFOSC Spectroscopic Reduction',
+            """
+            <h3>ADFOSC Spectroscopic Reduction Pipeline</h3>
+            <p>GUI wrapper for bias/flat reduction, spectral extraction, 
+            arc wavelength calibration, combination, and flux calibration.</p>.
+            <hr>
+
+            <p><b>Developed by:</b><br>
+            Jincen Jose<br>
+            Aryabhatta Research Institute of Observational Sciences (ARIES)<br>
+            Nainital, Uttarakhand, India</p>
+
+            <p><b>For queries, suggestions, or bug reports:</b><br>
+            Email: <a>jincen@aries.res.in</a><br>
+            --------: <a>jinn.aries@gmail.com</a></p>
+
+            <hr>
+
+            <p>Built with Python, PyQt5 and Matplotlib.</p>
+            """
+            )
 
     def set_theme(self, name):
         if name not in self.THEMES:
