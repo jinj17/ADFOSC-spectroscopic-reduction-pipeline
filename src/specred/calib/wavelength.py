@@ -15,24 +15,14 @@ from specred.calib import flux as fluxcal
 from specred import utils as add
 from astropy import units as u
 from scipy.interpolate import CubicSpline
-import matplotlib.gridspec as gridspec
-
-from sklearn.linear_model import RANSACRegressor, HuberRegressor
 from numpy.polynomial import Chebyshev
+import matplotlib.gridspec as gridspec
+from sklearn.linear_model import RANSACRegressor, HuberRegressor
 
-# NOTE (bug fix): this used to be os.path.dirname(os.path.abspath(__name__)),
-# which resolves the *module name string* against the current working
-# directory rather than this file's actual location -- so `scpath` (used
-# below for resources/arc/*.dat lookups) silently pointed at whatever
-# directory the process happened to be launched from. This is the same
-# bug already fixed in specred/utils.py; it was missed here in the first
-# pass because the two files weren't grepped for the exact same pattern
-# together. Fixed to use __file__ -- and note this file lives one level
-# deeper (specred/calib/) than utils.py (specred/), so it needs the extra
-# dirname() to land on the same specred/resources/ folder (matches the
-# pattern already used correctly in specred/calib/flux.py). The leftover
-# debug print was also removed.
-scpath = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+scpath = os.path.dirname(os.path.abspath(__file__))
+
+print(f" the script path : {scpath}")
+      
 def _gaus(x, a, b, x0, sigma):
     """
     Define a simple Gaussian curve
@@ -676,7 +666,7 @@ def legnedre_sol(Xpxl,Wpnts,pix_array,order):
     return zccd@c
 
 
-def fit_arclines_old(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="linear",deg=1,saveplot=False,plotoutdir=None):
+def fit_arclines_old(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="linear",deg=1,saveplot=False,plotoutdir=None,display=True,return_details=False):
     wave_lw= 3500
     wave_uw = 9000
 
@@ -709,6 +699,8 @@ def fit_arclines_old(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="
                     wcent_guess = spl(pcent_pix)
         
 
+    if not len(wcent_guess):
+        raise ValueError('No arc peaks detected; adjust the threshold.')
     inrng = sum((linewave >= np.nanmin(wcent_guess)) & (linewave <= np.nanmax(wcent_guess)))
     if not silent:
         print(str(len(wpoints)) + ' lines matched from ' + str(inrng) +' within estimated range.')
@@ -720,6 +712,10 @@ def fit_arclines_old(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="
     srt = np.argsort(xpoints)
     xpoints = xpoints[srt]
     wpoints = wpoints[srt]
+
+    minimum = {'spline': 4, 'quadratic': 3, 'cubic': 2, 'linear': 2, 'slinear': 2, 'zero': 2, 'polyfit': deg+1, 'legendre': deg+1}[func]
+    if len(xpoints) < minimum:
+        raise ValueError(f'{func} needs at least {minimum} matched lines; found {len(xpoints)}.')
 
     def XFIT1(x,a,b):
         return a*x+b
@@ -743,10 +739,17 @@ def fit_arclines_old(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="
         cs = CubicSpline(xpoints, wpoints, bc_type='natural')  # Natural cubic spline
         wavesolved = cs(sci_xp)
     
+    if not np.all(np.isfinite(wavesolved)) or not (np.all(np.diff(wavesolved) > 0) or np.all(np.diff(wavesolved) < 0)):
+        raise ValueError('Wavelength solution is not strictly monotonic; adjust the fitting function or degree.')
     pcent_pix1, wcent_pix1 = Find_peaks(wavesolved, flux, pwidth=10,pthreshold=pthreshold,minsep=autotol)
     A,B,C =add.closeval2(wcent_pix1,linewave,autotol)
     B = np.array(B)
     C = np.array(C)
+    details = dict(pixels=xpoints, wavelengths=wpoints, reference=linewave,
+                   estimated=wcent_guess, peak_wavelengths=wcent_pix1,
+                   residual_wave=B, residual=B-C)
+    if not display and not saveplot:
+        return (wavesolved, details) if return_details else wavesolved
     # mean_obs = np.mean(B)
     # SS_res = (B - C) ** 2
     # SS_tot = (B - mean_obs) ** 2
@@ -811,263 +814,157 @@ def fit_arclines_old(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="
     if saveplot:
         if plotoutdir !=None: plt.savefig(os.path.join(plotoutdir,"final_wavecalib.png"))
         else: print("provide directory to save wave calibrated plot")
-    plt.show()
+    if display:
+        plt.show()
+    else:
+        plt.close(fig)
+    return (wavesolved, details) if return_details else wavesolved
 
-
-    return wavesolved
 
 def find_peaks_robust(flux, prominence=None, distance=5, threshold_percentile=90, width=2):
-    """
-    Robust peak finding with background subtraction.
-    """
-    # 1. Estimate and subtract background using a median filter
-    # (Using a window size relative to the spectrum length, e.g., 5%)
-    #window_size = int(len(flux) * 0.05)
-    #if window_size % 2 == 0: window_size += 1
-    # Simple rolling median approximation (or use scipy.ndimage.median_filter)
-    # For speed/simplicity here, we'll just use a percentile threshold if background is flat-ish,
-    # but let's try a simple minimum filter for background estimation if needed.
-    # For now, the user's method of percentile is okay, but let's make it safer.
-    
+    """V2 percentile/prominence detection and local background-subtracted centroid."""
+    flux = np.asarray(flux, dtype=float)
+    valid = np.isfinite(flux)
+    if flux.ndim != 1 or not valid.any() or not 0 <= threshold_percentile <= 100:
+        raise ValueError('Invalid arc flux or peak threshold.')
+    low, high = np.percentile(flux[valid], [5, 95])
     if prominence is None:
-        # Auto-calculate prominence based on data range
-        prominence = (np.percentile(flux, 95) - np.percentile(flux, 5)) * 0.05
+        prominence = max((high-low)*0.05, np.finfo(float).eps)
+    finite_flux = np.where(valid, flux, low)
+    peaks, props = find_peaks(finite_flux, height=np.percentile(flux[valid], threshold_percentile), distance=distance, prominence=prominence, width=width)
+    accepted, centers, heights = [], [], []
+    for p, height in zip(peaks, props['peak_heights']):
+        start, end = max(0, p-3), min(len(flux), p+4)
+        if not valid[start:end].all():
+            continue
+        segment = flux[start:end]
+        weights = np.maximum(segment-np.min(segment), 0)
+        center = np.average(np.arange(start, end), weights=weights) if weights.sum() > 0 else float(p)
+        accepted.append(p)
+        centers.append(center)
+        heights.append(height)
+    return np.asarray(accepted, dtype=int), np.asarray(centers), np.asarray(heights)
 
-    height_thresh = np.percentile(flux, threshold_percentile)
-    
-    peaks, properties = find_peaks(flux, height=height_thresh, 
-                                  distance=distance, prominence=prominence, width=width)
-    
-    # Refine peak centers using centroid or gaussian fit around the peak
-    refined_centers = []
-    for p in peaks:
-        # Simple centroid in a small window
-        window = 3
-        start = max(0, p - window)
-        end = min(len(flux), p + window + 1)
-        y_segment = flux[start:end]
-        x_segment = np.arange(start, end)
-        
-        # Weighted average (centroid)
-        if np.sum(y_segment) > 0:
-            centroid = np.sum(x_segment * y_segment) / np.sum(y_segment)
-            refined_centers.append(centroid)
-        else:
-            refined_centers.append(p)
-            
-    return peaks, np.array(refined_centers), properties['peak_heights']
 
 def robust_poly_fit(x, y, deg=3, reject_sigma=3.0, max_iterations=5):
-    """
-    Fit a Chebyshev polynomial with iterative outlier rejection (sigma clipping).
-    Chebyshev polynomials are more stable at the edges than standard polynomials.
-    """
-    mask = np.ones(len(x), dtype=bool)
-    domain = [x.min(), x.max()] # Domain for Chebyshev mapping
-    
-    fit_res = None
-    
-    for i in range(max_iterations):
-        x_fit = x[mask]
-        y_fit = y[mask]
-        
-        if len(x_fit) < deg + 2:
+    """Fit a Chebyshev polynomial, iteratively rejecting residual outliers."""
+    x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+    mask = np.isfinite(x) & np.isfinite(y)
+    minimum = deg+2
+    if mask.sum() < minimum or np.unique(x[mask]).size < minimum:
+        raise ValueError(f'Need at least {minimum} distinct matched lines for degree {deg}.')
+    domain = [x[mask].min(), x[mask].max()]
+    for _ in range(max_iterations):
+        model = Chebyshev.fit(x[mask], y[mask], deg, domain=domain)
+        residual = y-model(x)
+        std = np.std(residual[mask])
+        if std <= 1e-10:
             break
-            
-        # Fit Chebyshev polynomial
-        # domain mapping is handled automatically by the class if we use the fit classmethod properly,
-        # but numpy.polynomial.Chebyshev.fit maps x to [-1, 1] based on the domain of x provided or inferred.
-        try:
-            c_fit = Chebyshev.fit(x_fit, y_fit, deg, domain=domain)
-        except Exception:
-            # Fallback to standard polyfit if Chebyshev fails (rare)
+        new_mask = mask & (np.abs(residual) <= reject_sigma*std)
+        if np.array_equal(mask, new_mask) or new_mask.sum() < minimum:
             break
-            
-        residuals = y_fit - c_fit(x_fit)
-        std_res = np.std(residuals)
-        
-        if std_res == 0:
-            break
-            
-        # Identify outliers
-        # We calculate residuals for ALL points to check if any deleted ones should come back?
-        # Standard sigma clipping usually just removes.
-        all_residuals = y - c_fit(x)
-        new_mask = np.abs(all_residuals) < (reject_sigma * std_res)
-        
-        if np.array_equal(mask, new_mask):
-            fit_res = c_fit
-            break
-            
         mask = new_mask
-        fit_res = c_fit
-        
-    return fit_res, mask
+    return Chebyshev.fit(x[mask], y[mask], deg, domain=domain), mask
+
 
 def match_lines_iterative(observed_peaks, reference_waves, initial_guess_func, tolerance=10):
-    """
-    Iteratively match peaks to reference lines.
-    1. Predict wavelengths using current solution.
-    2. Find nearest reference line.
-    3. Update solution.
-    """
-    matches_x = []
-    matches_w = []
-    
-    # Initial prediction
-    predicted_waves = initial_guess_func(observed_peaks)
+    """Nearest-line matching, quadratic refinement, then tighter rematching."""
+    peaks = np.asarray(observed_peaks, dtype=float)
+    reference = np.unique(np.asarray(reference_waves, dtype=float))
+    reference = reference[np.isfinite(reference)]
+    if not reference.size or tolerance <= 0:
+        raise ValueError('Reference lines and a positive tolerance are required.')
 
-    # First pass matching
-    for i, pred_w in enumerate(predicted_waves):
-        # Find closest reference line
-        diffs = np.abs(reference_waves - pred_w)
-        min_idx = np.argmin(diffs)
-        min_diff = diffs[min_idx]
-        
-        if min_diff < tolerance:
-            matches_x.append(observed_peaks[i])
-            matches_w.append(reference_waves[min_idx])
-            
-    matches_x = np.array(matches_x)
-    matches_w = np.array(matches_w)
-    
-    if len(matches_x) < 5:
-        return matches_x, matches_w
-        
-    # Refine fit and re-match (Iterative "Zipper" effect)
-    # We use a lower order for the first pass to get the global slope right
-    # Then higher order to catch curvature
-    
-    # Pass 1: Robust Linear/Quadratic Fit
-    poly, mask = robust_poly_fit(matches_x, matches_w, deg=2, reject_sigma=3.0)
-    
-    # Re-predict ALL peaks with this new solution
-    new_predicted = poly(observed_peaks)
-    
-    final_matches_x = []
-    final_matches_w = []
-    
-    # Stricter tolerance for final matching
-    final_tolerance = tolerance * 0.8
-    
-    for i, pred_w in enumerate(new_predicted):
-        diffs = np.abs(reference_waves - pred_w)
-        min_idx = np.argmin(diffs)
-        min_diff = diffs[min_idx]
-        
-        if min_diff < final_tolerance:
-            final_matches_x.append(observed_peaks[i])
-            final_matches_w.append(reference_waves[min_idx])
-            
-    return np.array(final_matches_x), np.array(final_matches_w)
+    def match(predicted, tol):
+        candidates = []
+        for i, pred in enumerate(predicted):
+            j = np.argmin(np.abs(reference-pred))
+            delta = abs(reference[j]-pred)
+            if delta < tol:
+                candidates.append((delta, i, j))
+        used, pairs = set(), []
+        for _, i, j in sorted(candidates):
+            if j not in used:
+                used.add(j)
+                pairs.append((peaks[i], reference[j]))
+        pairs.sort()
+        return (np.asarray([p[0] for p in pairs]), np.asarray([p[1] for p in pairs]))
 
-def calibrate_spectrum(flux, linelist, initial_guess_waves=None,pthreshold=90,autotol=10, order=3, plot=False):
-    """
-    Main calibration function.
-    
-    Args:
-        flux: 1D array of spectral flux
-        linelist: list of reference wavelengths
-        initial_guess_waves: 1D array of wavelengths corresponding to pixels (approximate solution)
-        order: Polynomial order for final fit
-    """
-    x_pixels = np.arange(len(flux))
-    flux = flux/np.nanmax(flux)
+    x, w = match(initial_guess_func(peaks), tolerance)
+    if len(x) < 5:
+        return x, w
+    model, _ = robust_poly_fit(x, w, deg=2, reject_sigma=3.0)
+    return match(model(peaks), tolerance*0.8)
 
-    # 1. Robust Peak Finding
-    # We use a high percentile to get only strong lines first
-    peak_idxs, peak_centers, peak_heights = find_peaks_robust(flux, threshold_percentile=pthreshold, distance=4)
-    
-    print(f"Found {len(peak_centers)} peaks.")
-    
-    if len(peak_centers) < 5:
-        print("Error: Too few peaks found.")
-        return None, None
-    
-    # 2. Initial Guess Function
-    if initial_guess_waves is not None:
-        # Create an interpolator for the initial guess
-        # Ensure sorted
-        if initial_guess_waves[1] < initial_guess_waves[0]:
-             # Handle reverse direction if needed, but usually wavelength increases with pixel
-             pass
-        guess_func = lambda x: np.interp(x, x_pixels, initial_guess_waves)
+
+def calibrate_spectrum(flux, linelist, initial_guess_waves=None, pthreshold=90, autotol=10, order=3, plot=False, return_details=False):
+    """V2 calibration: centroid peaks, iterative matching and robust Chebyshev fit."""
+    flux = np.asarray(flux, dtype=float)
+    if flux.ndim != 1 or len(flux) < 5 or not np.isfinite(flux).any():
+        raise ValueError('A finite 1D arc spectrum is required.')
+    pixels = np.arange(len(flux), dtype=float)
+    if isinstance(linelist, (str, os.PathLike)):
+        path = os.fspath(linelist)
+        if not os.path.isfile(path):
+            path = os.path.join(scpath, 'resources', 'arc', path)
+        reference = loadlinelist(path)
     else:
-        # Fallback: Assume linear coverage of min/max linelist (very rough)
-        print("Warning: No initial guess provided. Assuming linear coverage.")
-        guess_func = lambda x: np.interp(x, [0, len(flux)], [min(linelist), max(linelist)])
-
-    # 3. Iterative Matching
-    # Start with a generous tolerance
-    linewave = loadlinelist(linelist)
-
-    matched_x, matched_w = match_lines_iterative(peak_centers, linewave, guess_func, tolerance=autotol)
-    
-    print(f"Matched {len(matched_x)} lines after iteration.")
-    
-    if len(matched_x) < order + 2:
-        print("Error: Not enough matches for polynomial fit.")
-        return None, None
-        
-    # 4. Final Robust Fit (Chebyshev)
-    final_poly, mask = robust_poly_fit(matched_x, matched_w, deg=order, reject_sigma=2)
-    
-    # Filter outliers from the match list for reporting
-    clean_x = matched_x[mask]
-    clean_w = matched_w[mask]
-    
-    # 5. Generate Solution
-    wavelength_solution = final_poly(x_pixels)
-    
-    # Calculate RMS
-    residuals = clean_w - final_poly(clean_x)
-    rms = np.sqrt(np.mean(residuals**2))
-    print(f"Final RMS: {rms:.4f} A with {len(clean_x)} lines used.")
-    
+        reference = np.asarray(linelist, dtype=float)
+    reference = np.unique(reference[np.isfinite(reference)])
+    if not reference.size:
+        raise ValueError('Arc reference list contains no finite wavelengths.')
+    _, centers, _ = find_peaks_robust(flux, threshold_percentile=pthreshold, distance=4)
+    print(f'Found {len(centers)} peaks.')
+    if len(centers) < max(5, order+2):
+        raise ValueError('Too few arc peaks; reduce threshold or polynomial degree.')
+    initial = np.linspace(reference.min(), reference.max(), len(flux)) if initial_guess_waves is None else np.asarray(initial_guess_waves, dtype=float)
+    if initial.shape != flux.shape or not np.isfinite(initial).all():
+        raise ValueError('Initial wavelength grid must be finite and match the arc length.')
+    direction = np.sign(initial[-1]-initial[0])
+    if not direction or not np.all(direction*np.diff(initial) > 0):
+        raise ValueError('Initial wavelength grid must be strictly monotonic.')
+    guess = lambda x: np.interp(x, pixels, initial)
+    x, w = match_lines_iterative(centers, reference, guess, tolerance=autotol)
+    model, mask = robust_poly_fit(x, w, deg=order, reject_sigma=2.0)
+    solution = model(pixels)
+    if not np.isfinite(solution).all() or not np.all(direction*np.diff(solution) > 0):
+        raise ValueError('Non-monotonic wavelength solution; reduce degree or adjust initial solution.')
+    residual = model(x)-w
+    rms = float(np.sqrt(np.mean(residual[mask]**2)))
+    details = dict(pixels=x[mask], wavelengths=w[mask], rejected_pixels=x[~mask], rejected_wavelengths=w[~mask], residual_wave=w[mask], residual=residual[mask], rejected_residual=residual[~mask], reference=reference, estimated=guess(centers), peak_wavelengths=model(centers), rms=rms, degree=order)
+    print(f'Final RMS: {rms:.4f} Å; {mask.sum()} accepted, {(~mask).sum()} rejected lines.')
     if plot:
-        plt.figure(figsize=(15, 9))
-        
-        # Top: Spectrum + Matches
-        plt.subplot(2, 1, 1)
-        plt.plot(wavelength_solution, flux, 'k-', alpha=0.6, label='Calibrated Spectrum')
-        plt.scatter(clean_w, flux[clean_x.astype(int)], c='r', marker='x', label=f'Used Matches {len(clean_w)}')
-        
-        # Mark outliers
-        outliers_x = matched_x[~mask]
-        if len(outliers_x) > 0:
-             plt.scatter(matched_w[~mask], flux[outliers_x.astype(int)], c='orange', marker='o', facecolors='none', label=f'Outliers {len(outliers_x)}')
-             
-        #for lw in linelist:
-         #   plt.axvline(lw, color='g', alpha=0.2, ls=':')
-        
-        for xxi,idxx,res in zip(clean_w,clean_x,residuals):
-            idxx=int(idxx)
-            plt.axvline(xxi,color="brown",ls="dotted",alpha=0.7)
-            plt.text(xxi,flux[idxx]+0.05,np.round(xxi,2),rotation=89,fontsize=8)
-            plt.text(xxi,flux[idxx]+0.2,np.round(res,3),color="g",rotation=80) 
+        _plot_calibration(solution, flux, details, display=True)
+    return (solution, details) if return_details else (solution, (x[mask], w[mask], -residual[mask]))
 
-        plt.legend()
-        plt.title(f"Wavelength Calibration (RMS={rms:.3f})")
-        plt.xlabel("Wavelength")
-        plt.ylabel("Flux")
-        plt.xlim([3800,8900])
-        plt.ylim([-0.01,1.2])
-        
-        # Bottom: Residuals
-        plt.subplot(2, 1, 2)
-        plt.scatter(clean_w, residuals, c='b')
-        plt.axhline(0, color='k', ls='--')
-        plt.xlabel("Pixel")
-        plt.ylabel("Residual (A)")
-        plt.title("Residuals vs Wavelength")
-        
-        plt.tight_layout()
+
+def _plot_calibration(wave, flux, details, display=True, filename=None):
+    fig, (ax, res) = plt.subplots(2, 1, figsize=(15, 8), constrained_layout=True)
+    ax.plot(wave, flux, color='k', lw=0.8, label='Calibrated arc')
+    for x, w in zip(details['pixels'], details['wavelengths']):
+        ax.axvline(w, color='tab:orange', ls=':', alpha=0.6)
+        ax.annotate(f'{w:.2f}', (w, np.interp(x, np.arange(len(flux)), flux)), rotation=90, fontsize=8)
+    res.scatter(details['residual_wave'], details['residual'], label='Accepted')
+    res.scatter(details['rejected_wavelengths'], details['rejected_residual'], marker='x', color='tab:red', label='Rejected')
+    res.axhline(0, color='k', ls='--')
+    ax.set(title=f"Chebyshev degree {details['degree']} | RMS = {details['rms']:.4f} Å", xlabel='Wavelength (Å)', ylabel='Arc counts')
+    res.set(xlabel='Reference wavelength (Å)', ylabel='Fitted − reference (Å)')
+    res.legend()
+    if filename:
+        fig.savefig(filename, dpi=180)
+    if display:
         plt.show()
-        
-    return wavelength_solution, (clean_x, clean_w, residuals)
+    else:
+        plt.close(fig)
 
-def fit_arclines(wavespec,fluxspec,arcline,autotol=10,pthreshold=0.94,func="linear",deg=1,saveplot=True,plotoutdir=None):
-    if pthreshold < 1: pthreshold=pthreshold*100
-    wave,_ = calibrate_spectrum(flux=fluxspec, linelist=arcline, initial_guess_waves=wavespec,pthreshold=pthreshold,autotol=autotol, order=deg, plot=saveplot)
-    return wave
-    
+
+def fit_arclines(wavespec, fluxspec, arcline, autotol=10, pthreshold=0.94, func='chebyshev', deg=3, saveplot=False, plotoutdir=None, display=True, return_details=False):
+    """GUI-compatible wrapper for the V2 wavelength solution."""
+    threshold = pthreshold*100 if pthreshold <= 1 else pthreshold
+    wave, details = calibrate_spectrum(fluxspec, arcline, initial_guess_waves=wavespec, pthreshold=threshold, autotol=autotol, order=deg, return_details=True)
+    if display or saveplot:
+        filename = os.path.join(plotoutdir or os.getcwd(), 'final_wavecalib.png') if saveplot else None
+        _plot_calibration(wave, fluxspec, details, display=display, filename=filename)
+    return (wave, details) if return_details else wave
+
+

@@ -4,8 +4,6 @@ from astropy.table import Table
 from scipy.interpolate import UnivariateSpline
 from astropy.constants import c as cc
 import astropy.units as u
-from astropy.io import fits
-from astropy.nddata import StdDevUncertainty
 from specutils import Spectrum1D
 import os
 import pandas as pd
@@ -140,7 +138,7 @@ def onedstd(stdstar):
         astropy Table with onedstd data
     """
 
-def stdstr(stdstar):
+def stdstr(stdstar, display=True):
     std_dir = os.path.join(scpath,"resources",'onedstar')
     print("path to standard star mag files :",std_dir)
     '''
@@ -172,13 +170,14 @@ def stdstr(stdstar):
     std_flux = std_flux_spec.flux.value
    
     # add column with flux units to the Table
-    Stdflux = std_flux_spec.flux*u.Jy
+    Stdflux = std_flux_spec.flux
     print(Stdflux)
     standard.add_column(Stdflux, name='flux')
     
     
-    plt.plot(std_wave,std_flux)
-    plt.show()
+    if display:
+        plt.plot(std_wave,std_flux)
+        plt.show()
     return standard
 
 
@@ -327,120 +326,3 @@ def apply_sensfunc(object_spectrum, sensfunc_spec):
     # *should* update units properly, for both flux and uncertainty
     fluxcal_spec = object_spectrum.multiply(sensfunc2 * sensfunc_spec.flux.unit)
     return fluxcal_spec
-
-
-######################################################################################
-# The three functions below were originally embedded directly as GUI methods
-# (_load_calibrated_spectrum, _calibrate_flux, _save_flux_calibrated) inside
-# gui/main_window.py. They are pure I/O + calibration logic with no dependency
-# on Qt, so they've been moved here to keep the GUI a thin front-end and to
-# make flux calibration scriptable/testable without launching the GUI.
-######################################################################################
-
-def load_calibrated_spectrum(filename):
-    """
-    Load a wavelength-calibrated spectrum from a FITS file written by the
-    wavelength-calibration stage (expects 'WAVELENGTH' and optionally
-    'UNCERTAINTY' extensions alongside the primary flux array).
-
-    Returns
-    -------
-    Spectrum1D
-    """
-    with fits.open(filename) as hdul:
-        flux = hdul[0].data
-        wave = hdul['WAVELENGTH'].data
-        uncertainty = hdul['UNCERTAINTY'].data if 'UNCERTAINTY' in hdul else None
-
-    return Spectrum1D(
-        flux=flux * u.Unit('count'),
-        spectral_axis=wave * u.AA,
-        uncertainty=StdDevUncertainty(uncertainty) if uncertainty is not None else None
-    )
-
-
-def calibrate_flux(sci_spec, std_spec, extinction_file, sci_airmass, std_airmass,
-                    std_file, sens_mode='spline', display=False):
-    """
-    Perform flux calibration for a single science/standard pair:
-    airmass-correct both spectra, build a sensitivity function from the
-    standard, and apply it to the science spectrum.
-
-    Parameters
-    ----------
-    sci_spec, std_spec : Spectrum1D
-        Wavelength-calibrated science and standard-star spectra
-        (see load_calibrated_spectrum).
-    extinction_file : str
-        Path to the observatory extinction curve (read_obs_extinction).
-    sci_airmass, std_airmass : float
-        Airmass at the time of the science/standard exposures.
-    std_file : str
-        Name/path identifying the standard star's reference flux table
-        (passed to stdstr()).
-    sens_mode : str
-        Fitting mode passed through to standard_sensfunc.
-    display : bool
-        Whether standard_sensfunc should plot diagnostics.
-
-    Returns
-    -------
-    Spectrum1D
-        The flux-calibrated science spectrum.
-    """
-    if not os.path.exists(extinction_file):
-        raise FileNotFoundError(f"Extinction file not found: {extinction_file}")
-
-    Xfile = read_obs_extinction(extinction_file)
-
-    CAL = airmass_cor(std_spec, std_airmass, Xfile)
-    SCI = airmass_cor(sci_spec, sci_airmass, Xfile)
-
-    if not std_file:
-        raise ValueError("No standard star file selected")
-
-    star = stdstr(std_file)
-
-    sens_func = standard_sensfunc(CAL, star, mode=sens_mode, display=display)
-
-    return apply_sensfunc(SCI, sens_func)
-
-
-def save_flux_calibrated(spectrum, filename, calsrc=None, calmode=None):
-    """
-    Save a flux-calibrated Spectrum1D to a FITS file, writing flux in the
-    primary HDU (BUNIT erg/s/cm^2/Angstrom) plus WAVELENGTH and, if present,
-    UNCERTAINTY extensions.
-
-    Parameters
-    ----------
-    spectrum : Spectrum1D
-    filename : str
-        Output path.
-    calsrc : str, optional
-        Recorded in the CALSRC header keyword (e.g. the standard-star file used).
-    calmode : str, optional
-        Recorded in the CALMODE header keyword (e.g. the sensfunc fit mode used).
-    """
-    primary_hdu = fits.PrimaryHDU(spectrum.flux.value)
-    primary_hdu.header['BUNIT'] = 'erg/s/cm^2/Angstrom'
-
-    hdus = [primary_hdu]
-
-    if spectrum.uncertainty is not None:
-        uncert_hdu = fits.ImageHDU(spectrum.uncertainty.array, name='UNCERTAINTY')
-        hdus.append(uncert_hdu)
-
-    wave_hdu = fits.ImageHDU(spectrum.spectral_axis.value, name='WAVELENGTH')
-    wave_hdu.header['BUNIT'] = 'Angstrom'
-    hdus.append(wave_hdu)
-
-    if calsrc is not None:
-        primary_hdu.header['CALSRC'] = calsrc
-    if calmode is not None:
-        primary_hdu.header['CALMODE'] = calmode
-    primary_hdu.header['CRVAL1'] = spectrum.spectral_axis[0].value
-    primary_hdu.header['CDELT1'] = np.mean(np.diff(spectrum.spectral_axis.value))
-
-    hdulist = fits.HDUList(hdus)
-    hdulist.writeto(filename, overwrite=True)

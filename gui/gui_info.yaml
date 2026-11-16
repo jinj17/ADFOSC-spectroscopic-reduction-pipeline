@@ -1,0 +1,100 @@
+# GUI help text. Edit titles and descriptions and restart the GUI.
+# Keys are used by create_info_label() and _add_table_help().
+trim:
+  title: Trim the 2D FITS image
+  description: >-
+    Crop the CCD image to the instrument's configured region before reduction.
+    The default Python slice is X=[0,2030) and Y=[550,1640) pixxel. Disable this for already trimmed images.
+flat_smoothing:
+  title: Continuum-flat smoothing
+  description: >-
+    Smooth the one-dimensional continuum-lamp response along the dispersion
+    axis before constructing the normalized flat. This is not smoothing of the science image.
+cosmic_ray:
+  title: Cosmic-ray correction
+  description: Enable cosmic-ray detection and cleaning during flat correction.
+guess:
+  title: Initial spatial trace position
+  description: >-
+    Approximate Y pixel of the spectrum in the oriented 2D image, at the
+    central trace region. Use Pick Y on image or edit the selected file's row.
+xlim:
+  title: Trace dispersion limit
+  description: >-
+    Maximum X coordinate used for tracing, in dispersion pixels. The trace
+    samples the region from X=0 up to this exclusive limit.
+bin_width:
+  title: Trace bin width
+  description: >-
+    Number of dispersion pixels combined to estimate the spatial centroid
+    in each trace bin. Wider bins improve signal-to-noise but reduce spatial sampling.
+ap_width:
+  title: Extraction aperture half-width
+  description: >-
+    Distance in pixels on each side of the fitted spatial trace used for
+    spectral extraction. Choose a width sufficient to contain the source profile.
+sky_gap:
+  title: Sky separation
+  description: Distance in spatial pixels between the aperture edge and the inner sky region on each side.
+search_width:
+  title: Spatial centroid search half-width
+  description: Half-width in spatial pixels of the local search around the predicted trace position.
+max_shift:
+  title: Maximum trace shift
+  description: Maximum permitted spatial displacement between successive trace bins, in pixels.
+sky_width:
+  title: Sky-region width
+  description: Width of each sky background region in spatial pixels.
+sky_degree:
+  title: Sky polynomial degree
+  description: Degree of the spatial sky-background model. Zero represents a constant background.
+psf_sigma:
+  title: Spatial PSF sigma
+  description: Gaussian spatial-profile standard deviation in pixels used by the variance-weighted extraction.
+extract_method:
+  title: Extraction method
+  description: Sum performs box extraction; variance performs the implemented profile and variance-weighted extraction.
+combine_id:
+  title: Combine ID
+  description: >-
+    Spectra sharing the same ID are combined together. Distinct IDs remain
+    separate through wavelength calibration, flux calibration and final FITS export.
+    Select All to combine and preview all groups. Match science and standard IDs
+    when multiple standard groups exist.
+arc_file:
+  title: Arc reference line file
+  description: >-
+    ASCII reference line list containing known arc wavelengths in Angstroms
+    and line strengths or identifiers. Select the correct lamp and grism reference file.
+combine_method:
+  title: Spectrum combination method
+  description: Choose arithmetic mean, inverse-variance weighting or median for spectra within each Combine ID.
+match_tolerance:
+  title: Arc-line matching tolerance
+  description: Maximum permitted distance in Angstroms between an estimated peak wavelength and a reference wavelength.
+peak_threshold:
+  title: Arc peak percentile
+  description: >-
+    Fractional percentile of the arc flux distribution used for the minimum peak
+    height. For example, 0.94 means the 94th percentile, not 94% of the maximum flux.
+poly_degree:
+  title: Chebyshev polynomial degree
+  description: Degree of the wavelength solution. Higher degrees require more matched lines and may overfit the calibration.
+extinction:
+  title: Atmospheric extinction file
+  description: Observatory-specific reference extinction as a function of wavelength, used for airmass correction.
+standard_star:
+  title: Spectrophotometric standard
+  description: Select the reference standard-star spectrum used to derive the sensitivity function.
+sensitivity_mode:
+  title: Sensitivity interpolation
+  description: Choose how the sensitivity function is fitted between valid reference flux bins.
+redshift:
+  title: Redshift
+  description: Transform the displayed wavelengths to the rest frame using wavelength/(1+z). The stored native spectrum remains unchanged.
+wavelength_cutoff:
+  title: Wavelength range
+  description: Restrict the preview and saved plot to the selected observed-frame wavelength interval in Angstroms.
+output_bin:
+  title: Output bin size
+  description: Number of consecutive spectral pixels averaged per displayed bin. One disables the binned overlay; the saved FITS table is unchanged.

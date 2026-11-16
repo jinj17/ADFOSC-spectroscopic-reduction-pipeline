@@ -49,21 +49,40 @@ def final_plot(spec,name=None,wbin=True,lw=4500,uw=9000):
     plt.minorticks_on()
     plt.show()
 
-def save_plot(spec,name=None,wbin=True,lw=4500,uw=9000,redshift=0.0):
-    box_kernel = Box1DKernel(5)
-    wave = spec.spectral_axis.value
-    flux = spec.flux.value
+def preview_arrays(spec, wbin=False, lw=4500, uw=9000, redshift=0.0, binsize=5):
+    """Return raw and non-overlapping mean-binned samples for display only."""
+    wave = np.asarray(spec.spectral_axis.value, dtype=float)
+    flux = np.asarray(spec.flux.value, dtype=float)
+    if redshift <= -1 or binsize < 1:
+        raise ValueError('Invalid redshift or bin size.')
     if wbin:
-        newbin = np.where((wave > lw) & (wave < uw))
-        wave = wave[newbin]
-        flux = flux[newbin]
-        
-    newflx = convolve(flux,box_kernel)
-    Z = 1+redshift
+        if lw >= uw:
+            raise ValueError('Lower wavelength cutoff must be below upper cutoff.')
+        mask = (wave >= lw) & (wave <= uw)
+        wave, flux = wave[mask], flux[mask]
+    if not np.any(np.isfinite(wave) & np.isfinite(flux)):
+        raise ValueError('No finite spectrum in the selected range.')
+    wave = wave / (1 + redshift)
+    bw, bf = [], []
+    for start in range(0, len(wave), binsize):
+        x, y = wave[start:start+binsize], flux[start:start+binsize]
+        valid = np.isfinite(x) & np.isfinite(y)
+        if valid.any():
+            bw.append(np.mean(x[valid]))
+            bf.append(np.mean(y[valid]))
+        else:
+            bw.append(np.nan)
+            bf.append(np.nan)
+    return wave, flux, np.asarray(bw), np.asarray(bf)
+
+
+def save_plot(spec,name=None,wbin=True,lw=4500,uw=9000,redshift=0.0,binsize=5,display=True):
+    wave, flux, bw, bf = preview_arrays(spec, wbin, lw, uw, redshift, binsize)
     plt.figure(figsize=(10,6))
-    plt.plot(wave/Z, flux,alpha=0.5, color='r')
-    plt.plot(wave/Z,newflx,color='k',label="smoothed (5px)")
-    plt.ylabel(r'Flux [$ergs/s/cm^2/\AA$]',fontsize=12)
+    plt.plot(wave, flux,alpha=0.5, color='r', label='Observed spectrum')
+    if binsize > 1:
+        plt.plot(bw,bf,color='k',label=f'Binned ({binsize} px)')
+    plt.ylabel(f'Flux [{spec.flux.unit}]',fontsize=12)
     if redshift >0.0:
         plt.axvline(6563,color="green",alpha=0.7,ls="dashed",label="H alpha")
         plt.axvline(5007,color="violet",alpha=0.7,ls="dashed",label="OIII")
@@ -74,10 +93,13 @@ def save_plot(spec,name=None,wbin=True,lw=4500,uw=9000,redshift=0.0):
         plt.title(name,fontsize=12)
     imgpath = os.path.join(os.getcwd(),f"final_{name}.png")
     plt.legend()
-    plt.savefig(imgpath,dpi=200)
     plt.grid(alpha=0.5,ls="--")
     plt.minorticks_on()
-    plt.show()
+    plt.savefig(imgpath,dpi=200,bbox_inches='tight')
+    if display:
+        plt.show()
+    else:
+        plt.close()
                
 def save_spectrum(spec,name):
     wave = spec.spectral_axis.value

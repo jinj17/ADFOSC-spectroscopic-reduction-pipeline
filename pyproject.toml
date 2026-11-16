@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "specred"
-version = "0.1.0"
+version = "1.1.0"
 description = "Long-slit spectroscopy reduction pipeline (bias, flat, cosmic-ray removal, aperture extraction, wavelength & flux calibration) with an optional PyQt GUI."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -21,10 +21,11 @@ dependencies = [
     "specutils",
     "PyYAML",
     "julian",
+    "pyqtgraph",
 ]
 
 [project.optional-dependencies]
-gui = ["PyQt5"]
+gui = ["PyQt5","pyqtgraph"]
 
 [project.scripts]
 specred-gui = "gui.main_window:main"
@@ -36,7 +37,6 @@ packages = [
     "specred.extraction",
     "specred.instruments",
     "gui",
-    "gui.dialogs",
 ]
 
 [tool.setuptools.package-dir]

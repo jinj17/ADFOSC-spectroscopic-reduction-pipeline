@@ -10,3 +10,4 @@ ccdproc
 specutils
 PyYAML
 julian
+pyqtgraph

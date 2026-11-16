@@ -1,341 +1,158 @@
+"""ADFOSC spectral-flat normalization and flat-field correction.
+
+Python 3.8-compatible. No plotting/GUI dependency. Designed to be called by
+PyQt5 / PyQtGraph GUI; returns arrays for the GUI to visualize.
+"""
+from pathlib import Path
 import numpy as np
-import matplotlib.pyplot as plt
-from astropy.convolution import convolve, Box1DKernel
-from astropy import units as u
-from astropy.nddata import CCDData
-import ccdproc
 from astropy.io import fits
-from scipy.interpolate import CubicSpline
+from astropy.nddata import CCDData
+from astropy import units as u
 from astropy.convolution import convolve, Box1DKernel
-from ccdproc import Combiner, trim_image
-from astropy.stats import mad_std
+import ccdproc
+from scipy.interpolate import CubicSpline
 
-__all__ =["lamp_response","flat_correction"]
-
-
-
-# this cell contains function to find the response curve and form the normailised flat frame.
-# also defined the function to do the flat correction.
+__all__ = ['lamp_response', 'flat_correction', 'read_ccd_data']
 
 
-def read_ccd_data_old(file):
-    # since there is some issue with the updated header and ccdproc fits file read format so use fits.open"
-    if isinstance(file, str):
-        return ccdproc.CCDData.read(file, unit="adu")
-    elif isinstance(file, ccdproc.CCDData):
-        return file
-    elif isinstance(file,fits.hdu.hdulist.HDUList):
-        return ccdproc.CCDData(file[0].data,unit="adu")
-    
-    else:
-        raise ValueError("Invalid file format")
-
-def read_ccd_data(file):
-    if isinstance(file, str):
-        print("read ccd 1")
-        #print(f"the file provided in read_ccd_data func {file}")
-        #print(f" the header  {fits.open(file)[0].header}")
-        return fits.open(file)[0] #ccdproc.CCDData.read(file, unit="adu")
-    elif isinstance(file, ccdproc.CCDData):
-        print("read ccd 2 ")
-        return file
-    elif isinstance(file,fits.hdu.hdulist.HDUList):
-        print("read ccd 3")
-        return fits.open(file[0].data)[0] #ccdproc.CCDData(file[0].data,unit="adu")
-    
-    else:
-        raise ValueError("Invalid file format")
-    
+def read_ccd_data(source):
+    """Read a path, CCDData, HDU or HDUList into an independent CCDData (ADU)."""
+    if isinstance(source, CCDData):
+        return source.copy()
+    if isinstance(source, (str, Path)):
+        with fits.open(str(source), memmap=False) as hdul:
+            hdu = next((h for h in hdul if h.data is not None and np.ndim(h.data) == 2), None)
+            if hdu is None:
+                raise ValueError('No 2D image found in {}'.format(source))
+            return CCDData(np.asarray(hdu.data, dtype=float).copy(), unit=u.adu, meta=hdu.header.copy())
+    if isinstance(source, fits.HDUList):
+        hdu = next((h for h in source if h.data is not None and np.ndim(h.data) == 2), None)
+        if hdu is None:
+            raise ValueError('No 2D image found in HDUList')
+        return CCDData(np.asarray(hdu.data, dtype=float).copy(), unit=u.adu, meta=hdu.header.copy())
+    if isinstance(source, (fits.PrimaryHDU, fits.ImageHDU, fits.CompImageHDU)):
+        return CCDData(np.asarray(source.data, dtype=float).copy(), unit=u.adu, meta=source.header.copy())
+    if isinstance(source, np.ndarray) and source.ndim == 2:
+        return CCDData(np.asarray(source, dtype=float).copy(), unit=u.adu)
+    raise TypeError('Expected CCDData, FITS image, path or 2D numpy array')
 
 
+def _write_fits(path, image, header=None, history=None):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    hdr = header.copy() if header is not None else fits.Header()
+    if history:
+        hdr.add_history(history)
+    fits.writeto(str(path), np.asarray(image, dtype=np.float32), hdr, overwrite=True)
+    return str(path)
 
-def lamp_response(file,flat_combine = False,smooth=False, npix=11, display=False,Saxis=0, Waxis=1, ax=None, func = False):
-    
+
+def lamp_response(file, flat_combine=False, smooth=False, npix=11, display=False,
+                  Saxis=0, Waxis=None, ax=None, func=False, output='nflat.fits',
+                  return_response=False):
+    """Build a normalized continuum flat by removing its 1D lamp spectrum.
+
+    `file`: FITS path, CCDData, or nonempty list/tuple thereof.
+    `Saxis`: spatial axis (0 for usual FITS [y, x], 1 for swapped).
+    `smooth`: boxcar smooth the 1D spectral response along dispersion.
+    `func`: retained for legacy compatibility; no redundant interpolating
+        spline is fitted, since that reproduces exactly the same samples.
+    `display` / `ax`: accepted but never open a Matplotlib window.
+    `output`: output path; None disables writing.
+    Returns normalized flat array, or (flat, response, raw_profile) if
+    `return_response=True`.
     """
-    Divide out the spatially-averaged spectrum response from the flat image.
-    This is to remove the spectral response of the flatfield (e.g. Quartz) lamp.
-
-    Input flat is first averaged along the spatial dimension to make a 1-D flat.
-    This is optionally smoothed, and then the 1-D flat is divided out of each row
-    of the image.
-
-    Note: implicitly assumes spatial and spectral axes are orthogonal, i.e. does not
-    trace lines of constant wavelength for normalization.
-
-    If n number of files been provided then at first the flat combine will be done, 
-    which is optional. Afterwards the procedure for finding response curve will done
-
-    -----------------------------------------------------------------------------------------
-
-    Parameters
-    ----------
-    file : flat file or list of flat files
-        each file is called as CCDData Object
-    flat_combine: bool (default=False)
-        if yes, then the files provided in the list will be flat combined using ccdproc.combine    
-    smooth : bool (default=False)
-        Should the 1-D, mean-combined flat be smoothed before dividing out?
-    npix : int (default=11)
-        if `smooth=True`, how big of a boxcar smooth kernel should be used (in pixels)?
-    display : bool (default=False)
-    Saxis : int, optional
-        Set which axis is the spatial dimension. For DIS, Saxis=0
-        (corresponds to NAXIS2 in header). For KOSMOS, Saxis=1.
-        (Default is 0)
-    Waxis : int, optional
-        Set which axis is the wavelength dimension. For DIS, Waxis=1
-        (corresponds to NAXIS1 in the header). For KOSMOS, Waxis=0.
-        (Default is 1)
-        NOTE: if Saxis is changed, Waxis will be updated, and visa versa.
-    ax : matplotlib axes or subplot object, optional
-        axes or subplot to be plotted onto. If not specified one will be 
-        created. (Default is None)
-    func: bool (default=False)
-        fits the spline curve over the smooth-curve or 1-D mean-combined flat
-
-    Returns
-    -------
-    flat : CCDData object  |
-    also saved as fits file (nflats.fits)
-
-    """
-    
-
-    #print("Saxis =",Saxis,"Waxis = ",Waxis)
-    if (Saxis == 1) | (Waxis == 0):
-        # if either axis is swapped, swap them both to be sure!
-        Saxis = 1
-        Waxis = 0
+    if Saxis not in (0, 1) or (Waxis is not None and Waxis != 1 - Saxis):
+        raise ValueError('Saxis/Waxis must specify complementary axes 0 and 1')
+    sources = file if isinstance(file, (list, tuple)) else [file]
+    if not sources:
+        raise ValueError('At least one continuum flat is required')
+    frames = [read_ccd_data(source) for source in sources]
+    if any(frame.shape != frames[0].shape for frame in frames):
+        raise ValueError('Continuum flats have inconsistent dimensions')
+    if len(frames) > 1:
+        if not flat_combine:
+            raise ValueError('Multiple flats provided: set flat_combine=True to combine them')
+        combined = ccdproc.combine(frames, method='median', sigma_clip=True,
+                                   sigma_clip_low_thresh=5, sigma_clip_high_thresh=5)
     else:
-        Saxis=0
-        Waxis=1
-    print("Saxis =",Saxis,"Waxis = ",Waxis)
-
-    
-    
-    fltlist=[]
-    flatdata=[]
-    
-    if isinstance(file,type([])):
-        print(" in flat correction its array")
-        print("len = ",len(file))
-        if len(file)>1:
-            if flat_combine !=False:
-                stng = str(input("doing the flat combine first, continue(y|n) ?:"))
-                # NOTE (bug fixes, this branch): three issues found during
-                # the public-release audit -- not reachable via the current
-                # GUI (which always passes a single filename, not a list),
-                # but real bugs for anyone calling lamp_response() directly
-                # with a list + flat_combine=True:
-                #   1. `y` was a bare undefined name, not the string "y".
-                #   2. `mad_std` was used but never imported in this file
-                #      (now imported above, matching specred.io's usage).
-                #   3. `for i in len(file):` tries to iterate over an int;
-                #      needs range(len(file)).
-                if stng == "y":
-                    print("combining the files")
-                    for i in range(len(file)):
-                        file_data  = read_ccd_data(file[i]).data
-                        flatdata.append(file_data)
-                        
-                        
-                mflat = ccdproc.combine(flatdata,method='median',sigma_clip=True,sigma_clip_low_thresh=5,
-                                                sigma_clip_high_thresh=5,sigma_clip_func=np.ma.median,sigma_clip_dev_func=mad_std)
-                mflat_header = file[0][0].header
-
-                
-        elif len(file)==1:
-            print("for flat correction, single file")
-            file_data = read_ccd_data(file)
-            mflat = file_data
-            mflat_header = file_data.header
-    else:
-        print(" for flat correction, idk file format")
-        file_data = read_ccd_data(file)
-        mflat = file_data.data
-        mflat_header = file_data.header
-    
-        
-        
-    medflat = mflat
-    #print("medflat = ",medflat)
-    #medflat = ccdproc.CCDData(mflat,unit = "adu")
-
-    
-
-    # average the data together along the "spatial" axis
-    flat_1d = np.nanmedian(medflat, axis=Saxis)
-    Flat1d=flat_1d
-    #print("flat 1d = ",flat_1d)
-    '''
-    for i in range(len(flat_1d)):
-        	if int(flat_1d[i]) > 61000:
-        		print("max count obtained = ",int(flat_1d[i]))
-        		msg2 = "the arc lamp contains value more than 60000"
-        		raise ValueError(msg2)
-    '''   		
-  
-
-    # optionally: add boxcar smoothing to the 1-D average
+        combined = frames[0]
+    data = np.asarray(combined.data, dtype=float)
+    raw_profile = np.nanmedian(data, axis=Saxis)
+    response = raw_profile.copy()
     if smooth:
-        sflat_1d = convolve(flat_1d, Box1DKernel(npix), boundary='extend')
-        flat_1d = sflat_1d
-        
-    	 
-    if func:
-        
-        
-        x = np.arange(1,medflat.shape[Waxis]+1,1)
-        cs = CubicSpline(x,flat_1d)
-        
-        
-        flat_1d = cs(x)
-        if display:
-            plt.plot(Flat1d,label="median combine of observed data")
-            plt.plot(sflat_1d,label="smoothed data")
-            plt.plot(flat_1d,label="fit")
-            plt.xlabel("pixel")
-            plt.ylabel("counts")
-            plt.legend()
-            plt.title("spectral response")
-            #plt.legend()
-            plt.show()
-    
-    '''
-    def residual(Cdata,refdata):
-        Diff = []
-        if len(Cdata)==len(refdata):
-            for i in range(len(Cdata)):
-                diff = Cdata[i] - refdata[i]
-                Diff.append(diff)
-
-        else:
-            print("do  not contain same length element")
-
-        return Diff
-                
-
-    plt.scatter(x,residual(flat_1d,Flat1d))
-    plt.title("residual")
-    plt.show()
-
-    plt.scatter(x,residual(flat_1d,sflat_1d))
-    plt.title("residual smooth")
-    plt.show()
-
-    '''
-    
-    # ADD? this averaged curve could be modeled w/ spline, polynomial, etc
-
-    # divide the spectral response from the flat lamp (e.g. quartz lamp)
-    ## the old way w/ numpy
-    # flat = np.zeros_like(medflat)
-    # for i in range(medflat.shape[Saxis]):
-    #     flat[i, :] = medflat[i, :] / flat_1d
-
-    ## the new way w/ CCDdata objects... i hope!
-    # flat = medflat.divide(flat_1d)
-    # NOPE, b/c CCDData divide doesn't like dividing arrays across the X-axis (works for Y-axis)
-
-    flat = np.zeros_like(medflat)
-    #print("flat= ",flat,"shape=",flat.shape[Saxis])
-    #print("medflat = ",medflat)
-    #print("flat_1d = ",flat_1d)
-    for i in range(flat.shape[Saxis]):
-        if Saxis == 0:
-            flat[i, :] = medflat[i, :]/flat_1d #medflat[i, :].divide(flat_1d).data
-        if Saxis == 1:
-            flat[:, i] = medflat[:, i]/flat_1d #medflat[:, i].divide(flat_1d).data
+        npix = int(npix)
+        if npix < 1 or npix > len(response):
+            raise ValueError('npix must be from 1 to the response length')
+        #response = convolve(response, Box1DKernel(npix), boundary='extend', nan_treatment='interpolate', preserve_nan=False)
+        response = convolve(response, Box1DKernel(npix), boundary='extend')
+        if func is False:
+            # No 1D profile interpolation is needed when evaluating on its original pixels.
+            good = np.isfinite(response) & (response > 0)
+            if good.sum() != len(response):
+                raise ValueError('Continuum flat response contains nonpositive or invalid values; check illumination and cropping')
+            denominator = response[None, :] if Saxis == 0 else response[:, None]
+            normalized = np.divide(data, denominator, out=np.full_like(data, np.nan), where=np.isfinite(denominator) & (denominator > 0))
+            # Robust global normalization ensures typical illuminated pixel response is ~1.
+            finite_positive = normalized[np.isfinite(normalized) & (normalized > 0)]
+            if not finite_positive.size:
+                raise ValueError('Normalized flat has no usable positive pixels')
+            scale = np.median(finite_positive)
+            normalized /= scale
+        elif func:
+            x = np.arange(1,len(response)+1,1)
+            cs = CubicSpline(x,response)
+            denominator = cs(x)
+            normalized = np.divide(data, denominator, out=np.full_like(data, np.nan), where=np.isfinite(denominator) & (denominator > 0))
+    if func and not smooth:
+        x = np.arange(1,len(response)+1,1)
+        cs = CubicSpline(x,response)
+        denominator = cs(x)    
+        normalized = np.divide(data, denominator, out=np.full_like(data, np.nan), where=np.isfinite(denominator) & (denominator > 0))
             
-    #flat = ccdproc.CCDData(flat, unit=medflat.unit)
-    #print("divided flat=",flat)
-    
-
-    # once again normalize, since (e.g. if haven't trimmed illumination region)
-    # averaging could be skewed by including some non-illuminated portion.
-    #flat = flat.divide(np.nanmedian(flat.data))
-    #print("re-divided flat=",flat)
-    # the resulting flat should just show the pixel-to-pixel variations we're after
-    if display:
-        if ax is None:
-            fig, ax = plt.subplots(1,1)
-        im = ax.imshow(flat, origin='lower', aspect='auto', cmap=plt.cm.inferno)
-        plt.colorbar(mappable=im)
-        
-        ax.set_title('flat')
-        plt.show()
-    mflat_header["comment"]= " Flat corrected"
-    print(" made the nflat")
-    fits.writeto("nflat.fits",flat,header=mflat_header,overwrite=True)
-
-    return flat
-    
-######################################################################################
-######################################################################################
+    if output is not None:
+        _write_fits(output, normalized, combined.header,
+                    'Continuum spectrum removed; spatial axis {}; smoothed={}'.format(Saxis, bool(smooth)))
+    if return_response:
+        return normalized, response, raw_profile
+    return normalized
 
 
+def flat_correction(cor_list, flat, cosmic_correction=True, output_dir=None,
+                    gain=1.0, readnoise=6.0, sigclip=5.0, skip_arc_cosmics=True):
+    """Flat-correct bias-subtracted FITS frames, optionally clean cosmic rays.
 
-def flat_correction(cor_list,flat,cosmic_correction=True):
-    
+    Input filenames retain their original relative naming convention, with
+    `fc_` prefixed to each basename. Returns output filenames relative to the
+    current working directory if output_dir is None, or full paths otherwise.
+    Arc files (com_* and lamp/arc-named files) are not CR-cleaned by default:
+    sharp emission features may be mistaken for cosmic rays.
     """
-    After getting the response curve, it is neccesary to make flat correction to 
-    all the source frames (science, standard source, lamp).
-
-    ----------------------------------------------------------------------------
-
-    Parameters:
-    -----------
-    cor_list : list or file
-        list of the files for flat correction
-        all files are then called as CCDData object
-    
-    flat : CCDData object or fits file
-        normalised flat file to be used for correction.
-    
-    Returns
-    ---------
-
-    flat corrected source frames in fits format, |
-    list of the flat-corrected frames
-    
-
-    """
-    namelst =[]
-
-    ## first check the flat file
-    flat_file = read_ccd_data(flat)    ## reading the normalised flat frame
-
-    for file in cor_list:
-        cor_file = read_ccd_data(file)   ## reading all the source frame for flat correction
-        hdr = cor_file.header
-        new_stng =  str("fc_")+file
-        nm = new_stng
-        namelst.append(nm)
-        #print(f" the file passed {cor_file.data[0]} \n and the nflat {flat_file.data}")
-        
-        data = np.divide(cor_file.data,flat_file.data) # ccdproc.flat_correct(ccdproc.CCDData(cor_file.data,unit="adu"),ccdproc.CCDData(flat_file.data,unit="adu")) # not using CCDData.divide or simple arithmatic division (i.e cor_file.data/flat_file.data)
-                                                        # bcoz it wont preserve the header information.
-        #data=ccdproc.flat_correct(ccdproc.CCDData(cor_file.data,unit="adu"),ccdproc.CCDData(flat_file.data,unit="adu"))
-        #print("data= ",data[0])
-        print(" flat normalized data shape",np.shape(data))
-        #data2,_ = ccdproc.cosmicray_median(data.data,rbox=10,error_image=None)
-        if cosmic_correction: data2,_ = ccdproc.cosmicray_lacosmic(data, readnoise=6*u.electron,gain=1*u.electron/u.adu, sigclip=5, verbose=True)
-        else: data2 = data
-        #print(f" cosmicray corrected data shape {np.shape(data2)}")
-        #plt.imshow(data2[0],cmap="gray",label="1")
-        #plt.imshow(data2[1],cmap="gray",label="2")
-        #plt.legend()
-        #plt.show()
-        #data2 =ccdproc.CCDData(data2,unit="adu")  # for timebeing till gui is prepared
-        #print(" the cosmic-ray corrected file shape",np.shape(data2))
-        hdr["comment"] = " Cosmic ray removed"
-        print("done the cosminc ray correction")
-        
-        fits.writeto(new_stng,data2,hdr,overwrite=True)
-     
-     
-    return namelst 
-    
-
-######################################################################################
-###################################################################################### 
+    if not cor_list:
+        raise ValueError('No science/standard/arc frames provided')
+    if gain <= 0 or readnoise < 0:
+        raise ValueError('Gain must be positive and read noise nonnegative')
+    flat_data = np.asarray(read_ccd_data(flat).data, dtype=float)
+##    bad_flat = ~np.isfinite(flat_data) | (flat_data <= 0)
+##    if np.any(bad_flat):
+##        raise ValueError('Normalized flat has {} invalid/nonpositive pixels; use a valid illumination mask'.format(int(bad_flat.sum())))
+    products = []
+    for filename in cor_list:
+        frame = read_ccd_data(filename)
+        if frame.shape != flat_data.shape:
+            raise ValueError('Flat {} does not match image {} shape {}'.format(flat_data.shape, filename, frame.shape))
+        corrected = np.asarray(frame.data, dtype=float) / flat_data
+        source_name = Path(filename).name
+        is_arc = source_name.lower().startswith(('com_', 'bs_com_', 'fc_com_')) or 'lamp' in source_name.lower() or 'arc' in source_name.lower()
+        run_cosmic = bool(cosmic_correction and not (skip_arc_cosmics and is_arc))
+        if run_cosmic:
+            ccd = CCDData(corrected, unit=u.adu, meta=frame.header.copy())
+            cleaned = ccdproc.cosmicray_lacosmic(ccd, gain=gain*u.electron/u.adu,
+                readnoise=readnoise*u.electron, sigclip=sigclip, gain_apply=False, verbose=False)
+            corrected = np.asarray(cleaned.data, dtype=float)
+        out_name = 'fc_' + source_name
+        dest = Path(output_dir) / out_name if output_dir else Path(out_name)
+        _write_fits(dest, corrected, frame.header, 'Normalized flat applied; cosmic rays cleaned={}'.format(run_cosmic))
+        products.append(str(dest))
+        print('Flat-corrected: {} (cosmic={})'.format(dest, run_cosmic))
+    return products

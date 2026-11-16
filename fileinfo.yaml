@@ -1,25 +1,25 @@
 # input pars
 
-workdir: "/disk1/ADFOSC_pp/RED_Spec/RED_CLAGN/20250407/P45"
+workdir: "/opt/test_spec_code/"
 
 bias_pattern: "bias*fit"
 
-continuum_lamp: "Lamp3*fit"
+continuum_lamp: "Lamp3*arc*fit"
 
 arc_lamp:
-  pattern: "lamp1*fit"
-  name: "HgAr.dat"
+  pattern: "lamp*fit"
+  name: "HgAr_neon.dat"
 
 standard_star:
-  pattern: "bd33d2642*fit"
-  name: "bd33d2642"
-  dispersion: "510"
+  pattern: "Feige66*fit"
+  name: "Feige66"
+  dispersion: "485"
   combine: "mean"
 
 science_obj:
-  pattern: "1606+3324*fit"
-  name: "1606+3324"
-  dispersion: "500"
+  pattern: "1101+1102*fit"
+  name: "1101+1102"
+  dispersion: "465"
   xlim: "1500"
   combine: "mean"
 

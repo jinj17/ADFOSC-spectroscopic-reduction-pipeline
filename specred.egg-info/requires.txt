@@ -1,0 +1,16 @@
+numpy
+scipy
+pandas
+scikit-learn
+matplotlib
+astropy
+astroquery
+ccdproc
+specutils
+PyYAML
+julian
+pyqtgraph
+
+[gui]
+PyQt5
+pyqtgraph

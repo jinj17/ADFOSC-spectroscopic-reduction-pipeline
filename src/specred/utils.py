@@ -17,13 +17,9 @@ from numpy.polynomial import Legendre as legd
 
 __all__ = ['mshw','line_pks',"stdfile","redshift","redshift2"]
 
-# NOTE (bug fix): this used to be os.path.abspath(__name__), which
-# resolves the *module name string* against the current working
-# directory rather than the file's actual location -- so `scpath`
-# silently pointed at whatever directory the GUI/script happened to be
-# launched from, not this package. That made resources/arc/*.dat
-# lookups fail whenever this was imported from elsewhere on disk.
-scpath = os.path.dirname(os.path.abspath(__file__))
+scpath = os.path.dirname(os.path.abspath(__name__))
+
+print(f" the script path : {scpath}")
 #############################################################################
 #############################################################################   
 def _gaus(x, a, b, x0, sigma):
@@ -461,12 +457,8 @@ def stdfile(name):
     """
     global folder
 
-    # NOTE (bug fix): this used to be dirname(dirname(__file__)), which
-    # pointed one level higher than where scpath (above) looks for
-    # resources/arc/ -- the two lookups disagreed on where the shared
-    # `resources/` folder actually lives. Standardized to package_dir/resources/.
     maindir = os.path.dirname(os.path.realpath(__file__))
-
+    #maindir = os.path.realpath(__file__)
     source_dir =os.path.join(maindir,"resources/onedstar/")
 
     for i in os.listdir(source_dir):
@@ -1171,15 +1163,6 @@ def line_slider_button_old(xpt, ypt, arc_file, initial_offset=6326, initial_disp
 
 
 def line_slider_button2( xpt, ypt, file):
-    # NOTE: this function is not called anywhere in the library or GUI
-    # (verified during the public-release audit). It also has a
-    # pre-existing bug independent of this refactor: the `return
-    # new_offset, new_dispersion` below references names that only
-    # exist inside a commented-out nested function further down, so
-    # calling this as written would raise NameError. Left as dead code
-    # rather than guessing at the intended fix -- if you need this
-    # function, it likely should return offset_slider.val / disp_slider.val
-    # (the values apply_and_close actually sets) instead.
     """Version designed to work within Qt applications"""
     #from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg, NavigationToolbar2QT
     #from matplotlib.figure import Figure

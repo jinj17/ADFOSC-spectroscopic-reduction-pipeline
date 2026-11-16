@@ -1,0 +1,2 @@
+[console_scripts]
+specred-gui = gui.main_window:main

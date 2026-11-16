@@ -1,11 +1,4 @@
-"""
-Main GUI window for the spectroscopic reduction pipeline.
-
-This is a thin PyQt front-end: each tab collects parameters from the
-user and calls into the GUI-independent `specred` library
-(specred.io, specred.calib.*, specred.extraction, specred.output).
-The library itself can be scripted headlessly without this GUI.
-"""
+from pathlib import Path
 import sys
 import os
 import numpy as np
@@ -15,39 +8,39 @@ from specutils import Spectrum1D
 from astropy import units as u
 from astropy.nddata import StdDevUncertainty
 import matplotlib
-import matplotlib.pylab as pllt
+import matplotlib.pyplot as pllt
 import yaml
 matplotlib.use('Qt5Agg')
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.widgets import Slider, Button
+from scipy.signal import find_peaks
 from collections import defaultdict
 from astropy.convolution import convolve, Box1DKernel
-from astropy.table import Table
-# NOTE (bug fix): find_peaks (used in the sensitivity-preview plot) was
-# called without ever being imported. It was wrapped in a bare
-# try/except so it failed silently -- the peak markers on that plot
-# never actually appeared.
-from scipy.signal import find_peaks
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QGroupBox, QPushButton, QLabel, QLineEdit, QComboBox,
     QFileDialog, QTabWidget, QTextEdit, QCheckBox, QSpinBox,
     QDoubleSpinBox, QMessageBox, QTableWidget, QTableWidgetItem,
-    QStyledItemDelegate, QItemEditorFactory, QItemEditorCreatorBase,
-    QDialog,
+    QStyledItemDelegate,QItemEditorFactory, QItemEditorCreatorBase, QScrollArea, QFrame, QSplitter,QColorDialog, QActionGroup,
+    QToolButton, QSizePolicy
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QObject, pyqtSignal, QTimer,QSettings
 from PyQt5.QtGui import QIntValidator
+import pyqtgraph as pg
 
-# NOTE (bug fix): the original computed `scpath` via
-# os.path.dirname(os.path.abspath(__name__)) and sys.path.append'd it to
-# import loose script files. `__name__` is a *module name string*, not a
-# file path, so this resolved against the current working directory
-# rather than this file's real location -- it happened to work only
-# when launched from the right directory. Now that this is an
-# installed/importable package, no sys.path hacking is needed at all.
+script_dir = os.path.dirname(os.path.abspath(__file__))
+
+# Import reduction functions
+import specred
+script_dir = os.path.dirname(os.path.abspath(specred.__file__))
+
+scpath = script_dir
+print(f" the script path : {scpath}")
+if not os.path.isdir(scpath):
+    raise FileNotFoundError(f"Required pipeline folder not found: {scpath}")
+sys.path.insert(0, scpath)
 from specred import utils as add
 from specred.calib import flux as fluxcal
 from specred.calib import airmass
@@ -58,22 +51,189 @@ from specred import output as final
 from specred.extraction import aperture as aperture
 from specred.instruments import load_instrument, get_trim_box
 
-from gui.dialogs.wavelength_dialog import InteractiveWavelengthDialog
 
-# NOTE (bug fix): the GUI body has several defaults that build paths under
-# "resources/" (extinction table, standard-star tables, resource-path
-# field). The original `script_dir` was computed the same buggy way as
-# `scpath` used to be (os.path.dirname(os.path.abspath(__name__)),
-# resolved against the CWD rather than any real file location). Since
-# resources/ now lives inside the installed specred package
-# (src/specred/resources/), point script_dir there directly so these
-# defaults work regardless of which directory specred-gui is launched from.
-import specred
-script_dir = os.path.dirname(os.path.abspath(specred.__file__))
+from astropy.table import Table
 
 # Global spatial axis variable
 sxs = 0
 SXS = 0
+from PyQt5.QtWidgets import QDialog
+
+#=============================================================================================================================#
+
+class _ConsoleStream(QObject):
+    """Redirect Python print messages to the on-screen log safely via signals."""
+    message = pyqtSignal(str)
+
+    def __init__(self, original):
+        super().__init__()
+        self.original = original
+
+    def write(self, value):
+        if self.original:
+            self.original.write(value)
+        if value:
+            self.message.emit(str(value))
+
+    def flush(self):
+        if self.original:
+            self.original.flush()
+
+
+class InteractiveWavelengthDialog(QDialog):
+    def __init__(self, parent=None, xpt=None, ypt=None, arc_file=None,slit=None,grism=None):
+        super().__init__(parent)
+        self.setWindowTitle("Wavelength Calibration")
+        self.setModal(True)
+        
+        # Store the final values
+        self.final_offset = None
+        self.final_dispersion = None
+        
+        # Create matplotlib figure and canvas
+        self.figure = Figure(figsize=(18, 8))
+        self.canvas = FigureCanvas(self.figure)
+        self.ax = self.figure.add_subplot(111)
+        
+        # Setup UI
+        layout = QVBoxLayout()
+        layout.addWidget(self.canvas)
+        
+        # Add close button
+        close_btn = QPushButton("Apply and Close")
+        close_btn.clicked.connect(self.accept)
+        layout.addWidget(close_btn)
+        
+        self.setLayout(layout)
+        
+        # Initialize plot
+        self.init_plot(xpt, ypt, arc_file,slit,grism)
+    
+    def init_plot(self, xpt, ypt, arc_file,slit,grism):
+        """Initialize the interactive plot"""
+        # Your plotting code here
+        xpt = xpt - xpt[len(xpt) // 2]
+        self.xpt = xpt  # Store for updates
+        ARC = Table.read(arc_file, format="ascii", names=("wave", "flux"))
+        wave = ARC["wave"].value[::-1]
+        flux = ARC["flux"].value[::-1]
+        
+        wbin = np.where((wave > 3500) & (wave < 9000))
+        wave = wave[wbin]
+        flux = flux[wbin]
+        
+        ypt = ypt / np.nanmax(ypt)
+        SLIT = slit #self.slit.currentText()
+        GRISM = grism #self.grism.currentText()
+        config = {
+            ('1"', '676R-420gr/mm'):   (-3.38, 6300),
+            ('1"', '132R-600gr/mm'):   (-3.00, 6326),
+            ('1"', '770R-300gr/mm'):   (-7.00, 6400),
+            ('1.5"', '676R-420gr/mm'): (-3.355, 6305),
+            ('1.5"', '132R-600gr/mm'): (-2.27, 5800),
+            ('1.5"', '770R-300gr/mm'): (-7.00, 6500),
+            ('2"', '676R-420gr/mm'): (-3.35, 6326),
+            ('2"', '132R-600gr/mm'): (-2.27, 5800),
+            ('2"', '770R-300gr/mm'): (-7.00, 6500),
+        }
+
+        # Get the corresponding dispersion and offset values
+        dispersion, offset = config.get((SLIT, GRISM), (None, None))
+
+        if dispersion is None or offset is None:
+            raise ValueError(f"Unknown SLIT-GRISM combination: {SLIT}, {GRISM}")
+        Xpt = offset + xpt * dispersion
+        
+        self.ax.set_ylim(0, None)
+        #self.ax.plot(wave, flux, color="r", label="Reference Spectrum")
+        #add.zipplot(wave,flux,self.ax,color="r",label="Reference Spectrum")
+        for i, (x, y) in enumerate(zip(wave,flux)):
+            # Draw vertical line
+            self.ax.axvline(x=x, ymax=y, color="r", label="reference spectrum" if i == 0 else "")
+            # Place text slightly above the line
+            self.ax.text(x=x, y=y + 0.01, s="{:.2f}".format(x), rotation=90, color="g")
+        self.lines = self.ax.plot(Xpt, ypt, label="Observed spectrum")[0]
+        self.ax.legend()
+        
+        self.figure.subplots_adjust(left=0.25, bottom=0.25)
+        
+        # Create sliders
+        axoffset = self.figure.add_axes([0.25, 0.1, 0.65, 0.03])
+        self.offset_sdr = Slider(ax=axoffset, label="offset", valmin=1000, valmax=10000, valinit=offset)
+        
+        axdisp_A = self.figure.add_axes([0.1, 0.25, 0.03, 0.65])
+        self.A_disp_sdr = Slider(ax=axdisp_A, label="dispersion", valmin=-10, valmax=10, valinit=dispersion,
+                                orientation="vertical")
+        
+        axdisp_B = self.figure.add_axes([0.05, 0.25, 0.03, 0.65])
+        self.B_disp_sdr = Slider(ax=axdisp_B, label="dispersion", valmin=-1, valmax=1, valinit=0.0,
+                                orientation="vertical")
+
+        ## Adding buttons for incrementing offset and dispersion
+        increment_offset_button_ax = self.figure.add_axes([0.9, 0.01, 0.045, 0.03])
+        self.increment_offset_button = Button(increment_offset_button_ax, 'Offset +', hovercolor='0.975')
+
+        decrement_offset_button_ax = self.figure.add_axes([0.9, 0.04, 0.045, 0.03])
+        self.decrement_offset_button = Button(decrement_offset_button_ax, 'Offset -', hovercolor='0.975')
+        
+        increment_disp_button_ax = self.figure.add_axes([0.03, 0.1, 0.045, 0.03])
+        self.increment_disp_button = Button(increment_disp_button_ax, 'disp +', hovercolor='0.975')
+
+        decrement_disp_button_ax = self.figure.add_axes([0.075, 0.1, 0.045, 0.03])
+        self.decrement_disp_button = Button(decrement_disp_button_ax, 'Disp -', hovercolor='0.975')
+        
+        # Create buttons
+        button_ax = self.figure.add_axes([0.8, 0.15, 0.1, 0.05])
+        self.apply_button = Button(button_ax, 'Apply Values')
+        
+        # Connect events
+        self.offset_sdr.on_changed(self.update_plot)
+        self.A_disp_sdr.on_changed(self.update_plot)
+        self.B_disp_sdr.on_changed(self.update_plot)
+        self.apply_button.on_clicked(self.on_apply)
+
+        self.increment_offset_button.on_clicked(self.increment_offset)
+        self.increment_disp_button.on_clicked(self.increment_disp)
+        self.decrement_offset_button.on_clicked(self.decrement_offset)
+        self.decrement_disp_button.on_clicked(self.decrement_disp)
+        
+        self.canvas.draw()
+    
+    def update_plot(self, val):
+        """Update the plot when sliders change"""
+        new_xpt = self.offset_sdr.val + self.xpt * (self.A_disp_sdr.val + self.B_disp_sdr.val)
+        self.lines.set_xdata(new_xpt)
+        self.canvas.draw_idle()
+    
+    def on_apply(self, event):
+        """Store final values when Apply is clicked"""
+        self.final_offset = self.offset_sdr.val
+        self.final_dispersion = self.A_disp_sdr.val + self.B_disp_sdr.val
+        self.accept()
+    
+    def get_values(self):
+        """Return the final values"""
+        return self.final_offset, self.final_dispersion
+    def increment_offset(self,event):
+        current_offset = self.offset_sdr.val
+        self.offset_sdr.set_val(current_offset + 2)  # increment by 100 units
+    def decrement_offset(self,event):
+        current_offset = self.offset_sdr.val
+        self.offset_sdr.set_val(current_offset - 3)  # increment by 100 units
+
+    def increment_disp(self,event):
+        current_disp = self.A_disp_sdr.val + self.B_disp_sdr.val
+        self.A_disp_sdr.set_val(self.A_disp_sdr.val + 0.005)  # increment A_disp by 0.1 units
+    def decrement_disp(self,event):
+        current_disp = self.A_disp_sdr.val + self.B_disp_sdr.val
+        self.A_disp_sdr.set_val(self.A_disp_sdr.val - 0.005) 
+
+   
+
+    
+def XFIT(X,offset,disp):
+    new_X = offset +(X-X[len(X)//2])*disp
+    return new_X
 
 #=============================================================================================================================#
 
@@ -81,23 +241,212 @@ class SpectroscopicReductionGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Spectroscopic Reduction Pipeline")
-        self.setGeometry(10, 10, 1000, 1000)
+        self.resize(1750, 900)
+        self.setMinimumSize(1000, 650)
         
         # Initialize variables
         self.init_variables()
-        
+        self.info_details = self._load_info_details()
+        self.settings = QSettings('ADFOSC', 'SpectroscopicReduction')
+        self.theme_name = str(self.settings.value('theme', 'Dark'))
+        if self.theme_name not in self.THEMES:
+            self.theme_name = 'Dark'
+        #self.custom_accent = str(self.settings.value('accent', '') or '')
+        #self.custom_plot_bg = str(self.settings.value('plot_bg', '') or '')
         # Setup UI
         self.setup_ui()
+        self.apply_theme()
+        self.setup_menu()
+
+    def _load_info_details(self):
+        path = Path(script_dir) / 'gui_info.yaml'
+        try:
+            with path.open(encoding='utf-8') as stream:
+                data = yaml.safe_load(stream) or {}
+            return data if isinstance(data, dict) else {}
+        except (OSError, yaml.YAMLError) as exc:
+            print(f'Could not load GUI help: {exc}')
+            return {}
+
+    def create_info_label(self, key, text, checkbox=False):
+        """Wrap a label or existing checkbox with optional YAML-backed help."""
+        entry = self.info_details.get(key, {})
+        label = text if checkbox else QLabel(text)
+        if not isinstance(entry, dict) or not entry.get('description'):
+            return label
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+        button = QToolButton(container)
+        button.setText('ⓘ')
+        button.setToolTip(str(entry['description']))
+        button.setCursor(Qt.PointingHandCursor)
+        button.setFixedSize(15, 15)
+        button.setStyleSheet('QToolButton {color:#60A5FA;background:transparent;border:none;font-size:14px;} QToolButton:hover {color:#93C5FD;}')
+        button.clicked.connect(lambda: QMessageBox.information(container, str(entry.get('title', key)), str(entry['description'])))
+        layout.addWidget(label)
+        layout.addWidget(button)
+        #layout.addStretch()
+        container.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Preferred)
+        return container
+
+    def _add_table_help(self, table, keys):
+        """Clickable information icons in table headers, with hover tooltips."""
+        for col, key in keys.items():
+            entry = self.info_details.get(key, {})
+            item = table.horizontalHeaderItem(col)
+            if item is not None and isinstance(entry, dict) and entry.get('description'):
+                item.setText(item.text()+' ⓘ')
+                item.setToolTip(str(entry['description']))
+        def show_info(col):
+            entry = self.info_details.get(keys.get(col), {})
+            if isinstance(entry, dict) and entry.get('description'):
+                QMessageBox.information(self, str(entry.get('title', keys[col])), str(entry['description']))
+        table.horizontalHeader().setSectionsClickable(True)
+        table.horizontalHeader().sectionClicked.connect(show_info)
+
         
-        
+    # Keep colours centrally defined; presets work with Python 3.8 and Qt5.
+    THEMES = {
+        'Dark': dict(bg='#111923', surface='#141f2b', input='#172633', text='#e6edf5', muted='#98b4ca', border='#34485c', accent='#176c85', hover='#247e99', plot='#0d1823', plottext='#dce7ef'),
+        #'Midnight Blue': dict(bg='#0b1220', surface='#14213a', input='#1c2d4b', text='#e6efff', muted='#9fb3d1', border='#344b70', accent='#3b82f6', hover='#2563eb', plot='#080f1d', plottext='#cfddf6'),
+        #'Nord': dict(bg='#2e3440', surface='#3b4252', input='#434c5e', text='#eceff4', muted='#d8dee9', border='#566477', accent='#88c0d0', hover='#5e81ac', plot='#242933', plottext='#eceff4'),
+        'Dracula': dict(bg='#282a36', surface='#343746', input='#44475a', text='#f8f8f2', muted='#bdc0d1', border='#62708b', accent='#bd93f9', hover='#9966db', plot='#1f202a', plottext='#f8f8f2'),
+        'Catppuccin Mocha': dict(bg='#1e1e2e', surface='#313244', input='#45475a', text='#cdd6f4', muted='#a6adc8', border='#585b70', accent='#cba6f7', hover='#b4befe', plot='#181825', plottext='#cdd6f4'),
+        #'Monokai': dict(bg='#272822', surface='#33342a', input='#414339', text='#f8f8f2', muted='#b7b9ac', border='#616354', accent='#a6e22e', hover='#82b31d', plot='#20211c', plottext='#f8f8f2'),
+        'Graphite': dict(bg='#17191d', surface='#24272d', input='#30343c', text='#eef0f3', muted='#a8aeb8', border='#464c55', accent='#60a5fa', hover='#3b82f6', plot='#111317', plottext='#e6edf5'),
+        #'Forest': dict(bg='#102019', surface='#1b3125', input='#264232', text='#e1f4e7', muted='#a4c5af', border='#3d644b', accent='#33b679', hover='#218c5b', plot='#0d1812', plottext='#d4f2dc'),
+        'Solar Orange': dict(bg='#171512', surface='#29231c', input='#373025', text='#f8ead8', muted='#c6ae95', border='#594537', accent='#d5360c', hover='#ec6035', plot='#11100f', plottext='#f3e2c6'),
+        #'Rosewood': dict(bg='#21151c', surface='#35222e', input='#492e3d', text='#fbe9f0', muted='#d6b0c0', border='#70485e', accent='#e879a5', hover='#cb517f', plot='#190e15', plottext='#f9dce8'),
+        #'Solarized Dark': dict(bg='#002b36', surface='#073642', input='#104653', text='#eee8d5', muted='#93a1a1', border='#456773', accent='#268bd2', hover='#1b74ae', plot='#00212b', plottext='#93a1a1'),
+        'Slate': dict(bg='#161b24', surface='#202735', input='#273143', text='#e2e8f0', muted='#a5b4c7', border='#3d4b60', accent='#7c3aed', hover='#9061f9', plot='#10151e', plottext='#d8deea'),
+        'Light': dict(bg='#f3f6fa', surface='#ffffff', input='#ffffff', text='#1e293b', muted='#64748b', border='#cbd5e1', accent='#2563eb', hover='#1d4ed8', plot='#ffffff', plottext='#334155'),
+        'Arctic': dict(bg='#edf5f9', surface='#ffffff', input='#f6fbfd', text='#173247', muted='#617f91', border='#bfdae5', accent='#0e7490', hover='#155e75', plot='#ffffff', plottext='#173247'),
+        'Ivory': dict(bg='#f7f3e9', surface='#fffdf8', input='#fffaf0', text='#342b27', muted='#78695c', border='#ded2c1', accent='#b45309', hover='#92400e', plot='#fffefb', plottext='#46392f'),
+        #'Sakura': dict(bg='#fff4f7', surface='#ffffff', input='#fff9fb', text='#4b2533', muted='#8f6476', border='#edcad8', accent='#be185d', hover='#9d174d', plot='#ffffff', plottext='#60374a'),
+        #'Solarized Light': dict(bg='#fdf6e3', surface='#eee8d5', input='#fffaf0', text='#586e75', muted='#657b83', border='#c9c2ae', accent='#268bd2', hover='#1b74ae', plot='#fdf6e3', plottext='#586e75')
+    }
+    LIGHT_THEMES = ('Light', 'Arctic', 'Ivory')
+    
+    def setup_menu(self):
+        theme_menu = self.menuBar().addMenu('Theme')
+        group = QActionGroup(self)
+        group.setExclusive(True)
+        self.theme_actions = {}
+        theme_menu.addSection('Dark themes')
+        for name in self.THEMES:
+            if name in self.LIGHT_THEMES:
+                continue
+            action = theme_menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(name == self.theme_name)
+            action.triggered.connect(lambda checked, key=name: self.set_theme(key))
+            group.addAction(action)
+            self.theme_actions[name] = action
+        theme_menu.addSeparator()
+        theme_menu.addSection('Light themes')
+        for name in self.LIGHT_THEMES:
+            action = theme_menu.addAction(name)
+            action.setCheckable(True)
+            action.setChecked(name == self.theme_name)
+            action.triggered.connect(lambda checked, key=name: self.set_theme(key))
+            group.addAction(action)
+            self.theme_actions[name] = action
+        theme_menu.addSeparator()
+        #theme_menu.addAction('Choose accent colour…', self.choose_accent_color)
+        #theme_menu.addAction('Choose plot background…', self.choose_plot_background)
+        #theme_menu.addAction('Reset custom colours', self.reset_custom_colors)
+        menu = self.menuBar().addMenu('Help')
+        menu.addAction('About the pipeline', self.show_about)
+        menu.addAction('Open YAML configuration…', self.select_yaml_file)
+
+    def show_about(self):
+        QMessageBox.about(self, 'About ADFOSC Spectroscopic Reduction',
+            '<h3>ADFOSC Spectroscopic Reduction Pipeline</h3>'
+            '<p>GUI wrapper for bias/flat reduction, spectral extraction, '
+            'arc wavelength calibration, combination, and flux calibration.</p>'
+            '<p>Built with Python, PyQt5 and Matplotlib. '
+            'The reduction algorithms are provided by the local SCRIPTS directory.</p>')
+
+    def set_theme(self, name):
+        if name not in self.THEMES:
+            return
+        self.theme_name = name
+        #self.custom_accent = ''
+        #self.custom_plot_bg = ''
+        self.settings.setValue('theme', name)
+        #self.settings.remove('accent')
+        #self.settings.remove('plot_bg')
+        self.apply_theme()
+        for key, action in self.theme_actions.items():
+            action.setChecked(key == name)
+            
+    """
+    def apply_theme(self):
+        self.setStyleSheet('''
+            QMainWindow, QWidget {background: #111923; color: #e6edf5; font-size: 12px;}
+            QTabWidget::pane {border: 1px solid #314154; border-radius: 5px; background: #141f2b;}
+            QTabBar::tab {background: #223144; color: #cfdeec; padding: 10px 14px; margin-right: 2px;}
+            QTabBar::tab:selected {background: #176c85; color: white; font-weight: 600;}
+            QTabBar::tab:hover {background: #344b62;}
+            QGroupBox {border: 1px solid #34485c; border-radius: 7px; margin-top: 16px; padding: 12px; font-weight: 600;}
+            QGroupBox::title {subcontrol-origin: margin; left: 12px; padding: 0 5px; color: #8cdaea;}
+            QLabel#appHeading {font-size: 19px; font-weight: 700; color: #f2f8fd;}
+            QLabel#subtitle {color: #98b4ca; font-size: 11px;}
+            QPushButton {background: #264154; border: 1px solid #426179; padding: 7px 12px; border-radius: 4px;}
+            QPushButton:hover {background: #1c7190;}
+            QPushButton:pressed {background: #12536d;}
+            QPushButton:disabled {background: #202b36; color: #6b8193;}
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {background: #172633; color: #edf5fa; border: 1px solid #41576c; border-radius: 4px; padding: 5px;}
+            QTableWidget, QTextEdit {background: #0d1823; color: #dce7ef; alternate-background-color: #162536; gridline-color: #314457;}
+            QHeaderView::section {background: #253b4e; color: #e1edf6; padding: 6px; border: none; border-right: 1px solid #43566a;}
+            QScrollArea {border: none; background: #111923;}
+            QStatusBar {background: #1c2d3d; color: #bce4ec;}
+        ''')
+    """
+    def apply_theme(self):
+        c = dict(self.THEMES[self.theme_name])
+        self.colors = c
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{background-color: {c['bg']}; color: {c['text']}; font-size: 12px;}}
+            QMenuBar, QMenu {{background-color: {c['surface']}; color: {c['text']};}}
+            QMenu::item:selected {{background: {c['accent']}; color: white;}}
+            QTabWidget::pane {{border: 1px solid {c['border']}; border-radius: 5px; background: {c['surface']};}}
+            QTabBar::tab {{background: {c['surface']}; color: {c['text']}; padding: 11px 8px; min-width: 115px;}}
+            QTabBar::tab:selected {{background: {c['accent']}; color: white; font-weight: 600;}}
+            QTabBar::tab:hover:!selected {{background: {c['hover']}; color: white;}}
+            QGroupBox {{border: 1px solid {c['border']}; border-radius: 7px; margin-top: 16px; padding: 12px; font-weight: 600;}}
+            QGroupBox::title {{subcontrol-origin: margin; left: 12px; padding: 0 5px; color: {c['accent']};}}
+            QLabel#appHeading {{font-size: 19px; font-weight: 700; color: {c['text']};}}
+            QLabel#subtitle {{color: {c['muted']}; font-size: 11px;}}
+            QPushButton {{background: {c['surface']}; color: {c['text']}; border: 1px solid {c['border']}; padding: 7px 12px; border-radius: 4px;}}
+            QPushButton:hover {{background: {c['accent']}; color: white;}}
+            QPushButton:pressed {{background: {c['hover']}; color: white;}}
+            QPushButton:disabled {{background: {c['surface']}; color: {c['muted']};}}
+            QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{background: {c['input']}; color: {c['text']}; border: 1px solid {c['border']}; border-radius: 4px; padding: 5px;}}
+            QTableWidget, QTextEdit {{background: {c['plot']}; color: {c['text']}; alternate-background-color: {c['surface']}; gridline-color: {c['border']};}}
+            QHeaderView::section {{background: {c['surface']}; color: {c['text']}; padding: 6px; border: none; border-right: 1px solid {c['border']};}}
+            QScrollArea {{border: none; background: {c['bg']};}}
+            QStatusBar {{background: {c['surface']}; color: {c['muted']};}}
+            QSplitter::handle {{background: {c['border']};}}
+            QCheckBox::indicator {{border: 1px solid {c['border']};border-radius: 4px;}}
+            QCheckBox::indicator:checked {{background-color: {c['accent']};border: 1px solid {c['accent']};}}
+        """)
+        if hasattr(self, 'viewer_plot'):
+            self.viewer_plot.setBackground(c['plot'])
+            for axis in ('left', 'bottom', 'right', 'top'):
+                ax = self.viewer_plot.getAxis(axis)
+                ax.setPen(pg.mkPen(c['plottext']))
+                ax.setTextPen(pg.mkPen(c['plottext']))
+            self.viewer_plot.setLabel('bottom', self.viewer_plot.getAxis('bottom').labelText or 'Dispersion pixel', color=c['plottext'])
+            self.viewer_plot.setLabel('left', self.viewer_plot.getAxis('left').labelText or 'Spatial pixel / Flux', color=c['plottext'])
+        if hasattr(self, 'tabs'):
+            self.tabs.style().unpolish(self.tabs)
+            self.tabs.style().polish(self.tabs)
+            
     def init_variables(self):
         """Initialize all class variables"""
-        # Which instruments/<name>.yaml config to use for trim box,
-        # wavelength-solution guesses, etc. Only "adfosc" exists today;
-        # expose this as a dropdown in the UI if/when a second
-        # instrument config is added.
-        self.instrument_name = "adfosc"
-
         # File lists
         self.fileinfo =[]
         self.sci_lst = []
@@ -117,11 +466,15 @@ class SpectroscopicReductionGUI(QMainWindow):
         # Combined spectra
         self.comb_SCI = None
         self.comb_STD = None
+        self.combined_spectra = {'SCI': {}, 'STD': {}}
         
         # Calibrated spectra
         self.W_sci = None
         self.W_std = None
         self.final_spec = None
+        self.flux_calibrated = None
+        self.final_groups = {}
+        self.W_sci_groups, self.W_std_groups = {}, {}
         
         # Other
         self.sciname = ""
@@ -135,34 +488,291 @@ class SpectroscopicReductionGUI(QMainWindow):
         self.current_preview_type = None
         
     def setup_ui(self):
-        """Setup the main UI components"""
+        """Fixed three-part workstation: left controls, right viewer and log."""
         self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
         self.main_layout = QVBoxLayout(self.main_widget)
-        
-        # Create tabs
+        self.main_layout.setContentsMargins(6, 6, 6, 5)
+        self.main_layout.setSpacing(6)
+
+        header = QLabel('ADFOSC  |  SPECTROSCOPIC REDUCTION')
+        header.setObjectName('appHeading')
+        self.main_layout.addWidget(header)
+
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_layout.addWidget(self.main_splitter, 1)
+
+        # LEFT: all task tabs and their input fields, scrollable individually.
         self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setMinimumWidth(360)
         self.setup_file_selection_tab()
         self.setup_flat_correction_tab()
         self.setup_aperture_extraction_tab()
         self.setup_spectral_calibration_tab()
         self.setup_flux_calibration_tab()
         self.setup_output_tab()
-        self.main_layout.addWidget(self.tabs)
-        
-        # Console output
+        # Wrap each existing page safely: remove it from QTabWidget before
+        # reparenting it into QScrollArea, preserving its original tab state.
+        original_tabs = []
+        while self.tabs.count():
+            page = self.tabs.widget(0)
+            name = self.tabs.tabText(0)
+            enabled = self.tabs.isTabEnabled(0)
+            self.tabs.removeTab(0)
+            original_tabs.append((page, name, enabled))
+        for page, name, enabled in original_tabs:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.NoFrame)
+            scroll.setWidget(page)
+            index = self.tabs.addTab(scroll, name)
+            self.tabs.setTabEnabled(index, enabled)
+        # Vertical task navigation keeps every stage visible in the narrow left panel.
+        #self.tabs.setTabPosition(QTabWidget.West)
+        #self.tabs.setUsesScrollButtons(False)
+        self.tabs.setStyleSheet('QTabBar::tab {min-width: 120px; padding: 7.5px 2px;}')
+        self.main_splitter.addWidget(self.tabs)
+        self.tabs.currentChanged.connect(self._tab_changed)
+
+        # RIGHT: interactive viewer above an always-visible console.
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.setChildrenCollapsible(False)
+        viewer_panel = QWidget()
+        viewer_layout = QVBoxLayout(viewer_panel)
+        viewer_layout.setContentsMargins(6, 3, 6, 3)
+        viewer_header = QHBoxLayout()
+        viewer_header.addWidget(QLabel('INTERACTIVE VIEWER'))
+        self.viewer_title = QLabel('Select a file and click Preview')
+        self.viewer_title.setObjectName('subtitle')
+        viewer_header.addWidget(self.viewer_title, 1)
+        self.fit_view_btn = QPushButton('Fit view')
+        self.view_previous_btn = QPushButton('◀ Previous')
+        self.view_next_btn = QPushButton('Next ▶')
+        self.view_counter = QLabel('')
+        viewer_header.addWidget(self.view_previous_btn)
+        viewer_header.addWidget(self.view_counter)
+        viewer_header.addWidget(self.view_next_btn)
+        viewer_header.addWidget(self.fit_view_btn)
+        viewer_layout.addLayout(viewer_header)
+        self.viewer_plot = pg.PlotWidget()
+        self.viewer_plot.setBackground('#0d1823')
+        self.viewer_plot.setLabel('bottom', 'Dispersion pixel', color='#dce7ef')
+        self.viewer_plot.setLabel('left', 'Spatial pixel / Flux', color='#dce7ef')
+        self.viewer_plot.showGrid(x=True, y=True, alpha=0.13)
+        self.viewer_plot.getViewBox().setAspectLocked(False)
+        viewer_layout.addWidget(self.viewer_plot, 1)
+        self.viewer_readout = QLabel('Move the pointer over the plot to see coordinates')
+        viewer_layout.addWidget(self.viewer_readout)
+        self._aperture_views = []
+        self._aperture_view_index = -1
+        self.view_previous_btn.clicked.connect(lambda: self._navigate_aperture(-1))
+        self.view_next_btn.clicked.connect(lambda: self._navigate_aperture(1))
+        self._update_view_navigation()
+        self.fit_view_btn.clicked.connect(self.viewer_plot.autoRange)
+        self.viewer_plot.scene().sigMouseMoved.connect(self._viewer_mouse_moved)
+        self.viewer_plot.scene().sigMouseClicked.connect(self._viewer_mouse_clicked)
+        self.right_splitter.addWidget(viewer_panel)
+
+        log_panel = QWidget()
+        log_layout = QVBoxLayout(log_panel)
+        log_layout.setContentsMargins(6, 3, 6, 3)
+        log_header = QHBoxLayout()
+        log_header.addWidget(QLabel('PIPELINE LOG'))
+        log_header.addStretch(1)
+        clear_btn = QPushButton('Clear log')
+        clear_btn.clicked.connect(lambda: self.console.clear())
+        log_header.addWidget(clear_btn)
+        log_layout.addLayout(log_header)
         self.console = QTextEdit()
+        self.console.setObjectName('pipelineConsole')
         self.console.setReadOnly(True)
-        self.main_layout.addWidget(self.console)
-        
-        # Status bar
-        self.statusBar().showMessage("Ready")
-        
+        self.console.setPlaceholderText('Reduction status, errors, and print output appear here…')
+        log_layout.addWidget(self.console)
+        self.right_splitter.addWidget(log_panel)
+        self.main_splitter.addWidget(self.right_splitter)
+##        self.main_splitter.setStretchFactor(0, 0)
+##        self.main_splitter.setStretchFactor(1, 1)
+##        self.right_splitter.setStretchFactor(0, 1)
+##        self.right_splitter.setStretchFactor(1, 0)
+        self.main_splitter.setSizes([750, 1000])
+        self.right_splitter.setSizes([510, 250])
+        self._viewer_array = None
+        self._viewer_kind = None
+        self.statusBar().showMessage('Ready')
+
+        # Capture ordinary Python print() without changing scientific modules.
+        self._original_stdout, self._original_stderr = sys.stdout, sys.stderr
+        self._gui_stdout = _ConsoleStream(self._original_stdout)
+        self._gui_stderr = _ConsoleStream(self._original_stderr)
+        self._gui_stdout.message.connect(self._append_console)
+        self._gui_stderr.message.connect(self._append_console)
+        sys.stdout, sys.stderr = self._gui_stdout, self._gui_stderr
+
+    def _append_console(self, message):
+        cursor = self.console.textCursor()
+        cursor.movePosition(cursor.End)
+        cursor.insertText(message)
+        self.console.setTextCursor(cursor)
+        self.console.ensureCursorVisible()
+
+    def closeEvent(self, event):
+        if sys.stdout is self._gui_stdout:
+            sys.stdout = self._original_stdout
+        if sys.stderr is self._gui_stderr:
+            sys.stderr = self._original_stderr
+        super().closeEvent(event)
+
+    def _viewer_mouse_moved(self, scene_pos):
+        vb = self.viewer_plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(scene_pos):
+            return
+        point = vb.mapSceneToView(scene_pos)
+        x, y = point.x(), point.y()
+        if self._viewer_kind == 'image' and self._viewer_array is not None:
+            ix, iy = int(round(x)), int(round(y))
+            if 0 <= iy < self._viewer_array.shape[0] and 0 <= ix < self._viewer_array.shape[1]:
+                self.viewer_readout.setText('X: {}   Y: {}   Counts: {:.3f}'.format(ix, iy, self._viewer_array[iy, ix]))
+                return
+        if self._viewer_kind == 'curve':
+            self.viewer_readout.setText('X: {:.2f}   Y: {:.5g}'.format(x, y))
+            return
+        self.viewer_readout.setText('X: {:.1f}   Y: {:.1f}'.format(x, y))
+
+    def show_2d_view(self, data, title='', guess=None, xlim=None):
+        """Display FITS with image row=spatial and column=dispersion."""
+        data = np.asarray(data, dtype=float)
+        if data.ndim != 2:
+            raise ValueError('Viewer expects a 2D image.')
+        self.viewer_plot.clear()
+        self.viewer_plot.setLabel('bottom', 'Dispersion pixel')
+        self.viewer_plot.setLabel('left', 'Spatial pixel')
+        self._viewer_array, self._viewer_kind = data, 'image'
+        img = pg.ImageItem(axisOrder='row-major')
+        self.viewer_plot.addItem(img)
+        finite = data[np.isfinite(data)]
+        levels = np.percentile(finite, [5, 95]) if finite.size else [0, 1]
+        if levels[0] >= levels[1]:
+            levels[1] = levels[0] + 1
+        img.setImage(data, autoLevels=False, levels=levels)
+        self._image_item = img
+        if guess is not None:
+            self.viewer_plot.addItem(pg.InfiniteLine(pos=float(guess), angle=0, pen=pg.mkPen('#ff9c5b', width=1.5)))
+        if xlim is not None:
+            self.viewer_plot.addItem(pg.InfiniteLine(pos=float(xlim), angle=90, pen=pg.mkPen('#56d5f5', width=1.2)))
+        self.viewer_title.setText(str(title))
+        self.viewer_plot.autoRange()
+
+    def show_curve_view(self, x, y, title='', xlabel='Pixel', ylabel='Counts'):
+        """Plot a 1D spectrum/response curve in the persistent viewer."""
+        x, y = np.asarray(x, dtype=float), np.asarray(y, dtype=float)
+        self.viewer_plot.clear()
+        self.viewer_plot.setLabel('bottom', xlabel)
+        self.viewer_plot.setLabel('left', ylabel)
+        self.viewer_plot.plot(x, y, pen=pg.mkPen('#50c7dd', width=1.3), connect='finite')
+        self._viewer_array, self._viewer_kind = y, 'curve'
+        self.viewer_title.setText(str(title))
+        self.viewer_plot.autoRange()
+
+    def _update_view_navigation(self):
+        n = len(self._aperture_views)
+        self.view_previous_btn.setEnabled(n > 1 and self._aperture_view_index > 0)
+        self.view_next_btn.setEnabled(n > 1 and self._aperture_view_index < n-1)
+        self.view_counter.setText('{} / {}'.format(self._aperture_view_index+1, n) if n else '')
+
+    def _navigate_aperture(self, step):
+        idx = self._aperture_view_index + step
+        if 0 <= idx < len(self._aperture_views):
+            self._show_aperture_record(idx)
+
+    def _show_aperture_record(self, idx):
+        record = self._aperture_views[idx]
+        self._aperture_view_index = idx
+        if record['type'] == 'diagnostic':
+            self.viewer_plot.clear()
+            self.viewer_plot.setLabel('bottom', record['xlabel'])
+            self.viewer_plot.setLabel('left', record['ylabel'])
+            self.viewer_title.setText(record['title'])
+            self._viewer_kind, self._viewer_array = 'curve', None
+            if self.viewer_plot.plotItem.legend is None:
+                self.viewer_plot.addLegend(offset=(-10, 10))
+            for x, y, name, color, scatter in record['series']:
+                self.viewer_plot.plot(x, y, name=name, pen=None if scatter else pg.mkPen(color, width=1.5),
+                                      symbol='o' if scatter else None, symbolSize=6, symbolBrush=color, connect='finite')
+            for pos, label, color in record.get('lines', []):
+                self.viewer_plot.addItem(pg.InfiniteLine(pos=pos, angle=90, pen=pg.mkPen(color, style=Qt.DashLine), label=label, labelOpts={'position': 0.7, 'color': color, 'rotateAxis': (1, 0)}))
+            self.viewer_plot.autoRange()
+        elif record['type'] == 'image':
+            self.show_2d_view(record['data'], record['title'])
+            x = np.arange(len(record['trace']))
+            t = record['trace']
+            pen = lambda color, width=1.3: pg.mkPen(color, width=width)
+            def overlay(offset, color, width=1.3):
+                self.viewer_plot.plot(x, t+offset, pen=pen(color, width), connect='finite')
+            overlay(0, '#56e9e6', 2.0)
+            if record.get('apwidth') is not None:
+                a, gap, skyw = record['apwidth'], record['skysep'], record['skywidth']
+                for offset in (-a, a): overlay(offset, '#56e9e6')
+                for offset in (-a-gap, -a-gap-skyw, a+gap, a+gap+skyw):
+                    overlay(offset, '#fbb96a')
+            details = record.get('details')
+            if details:
+                pts = details['accepted'] & np.isfinite(details['bin_y'])
+                item = pg.ScatterPlotItem(x=details['bin_x'][pts], y=details['bin_y'][pts],
+                                          pen=None, brush=pg.mkBrush('#ffdf84'), size=5)
+                self.viewer_plot.addItem(item)
+        else:
+            curves = record['curves']
+            self.viewer_plot.clear()
+            self.viewer_plot.setLabel('bottom', 'Dispersion pixel')
+            self.viewer_plot.setLabel('left', 'Counts (ADU)')
+            self._viewer_kind = 'curve'
+            self._viewer_array = curves['net']
+            self.viewer_title.setText(record['title'])
+            x = np.arange(len(curves['net']))
+            self.viewer_plot.addLegend(offset=(-10, 10)) if self.viewer_plot.plotItem.legend is None else None
+            for key, color in [('raw', '#6ea8ff'), ('sky', '#f8ad62'), ('net', '#62e5c2')]:
+                self.viewer_plot.plot(x, curves[key], pen=pg.mkPen(color, width=1.4),
+                                      name=key, connect='finite')
+            self.viewer_plot.autoRange()
+        self._update_view_navigation()
+
+    def _diagnostic_views(self, records):
+        self._aperture_views = [dict(type='diagnostic', **record) for record in records]
+        self._show_aperture_record(0)
+
+    def _arc_views(self, wave, flux, details, title):
+        d = details
+        p = np.arange(len(flux))
+        previous = self._aperture_view_index if self.viewer_title.text().startswith(title+' —') else 0
+        summary = f"RMS {d['rms']:.4f} Å | {len(d['pixels'])} accepted, {len(d['rejected_pixels'])} rejected"
+        accepted = [(x, f'{w:.2f}', '#f8ad62') for x,w in zip(d['pixels'],d['wavelengths'])]
+        rejected = [(x, f'{w:.2f} rejected', '#ff6969') for x,w in zip(d['rejected_pixels'],d['rejected_wavelengths'])]
+        self._diagnostic_views([
+            dict(title=title+' — Identified lines | '+summary, xlabel='Pixel', ylabel='Arc counts', series=[(p, flux, 'Arc', '#50c7dd', False)], lines=accepted+rejected),
+            dict(title=title+' — Calibrated arc | '+summary, xlabel='Wavelength (Å)', ylabel='Arc counts', series=[(wave, flux, 'Calibrated arc', '#50c7dd', False)], lines=[(w, f'{w:.2f}', '#f8ad62') for w in d['wavelengths']]),
+            dict(title=title+' — Wavelength fit | '+summary, xlabel='Pixel', ylabel='Wavelength (Å)', series=[(p, wave, 'Chebyshev solution', '#50c7dd', False), (d['pixels'], d['wavelengths'], 'Accepted lines', '#f8ad62', True), (d['rejected_pixels'], d['rejected_wavelengths'], 'Rejected lines', '#ff6969', True)]),
+            dict(title=title+' — Residuals | '+summary, xlabel='Reference wavelength (Å)', ylabel='Fitted − reference (Å)', series=[(d['residual_wave'], d['residual'], 'Accepted', '#f8ad62', True), (d['rejected_wavelengths'], d['rejected_residual'], 'Rejected', '#ff6969', True), (np.array([np.min(wave), np.max(wave)]), np.zeros(2), 'Zero', '#50c7dd', False)])])
+        if previous > 0:
+            self._show_aperture_record(previous)
+
+    def _add_aperture_views(self, frame, trace, details, arrays, apwidth, skysep, skywidth, name):
+        """Three switchable views; both 2D panels share the same source image."""
+        self._aperture_views.extend([
+            dict(type='image', title=name+' — Traced spectrum', data=frame, trace=trace,
+                 details=details, apwidth=None),
+            dict(type='image', title=name+' — Aperture and sky regions', data=frame, trace=trace,
+                 apwidth=apwidth, skysep=skysep, skywidth=skywidth),
+            dict(type='curve', title=name+' — Raw / Sky / Sky-subtracted', curves=arrays)
+        ])
+        self._show_aperture_record(len(self._aperture_views)-3)
+
     def log_message(self, message):
         """Add message to console and status bar"""
         self.console.append(message)
         self.statusBar().showMessage(message)
-        QApplication.processEvents()  # Update GUI immediately
+        # The Qt event loop updates the console naturally; do not re-enter it here.
 
 
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
@@ -183,14 +793,11 @@ class SpectroscopicReductionGUI(QMainWindow):
         self.workdir = None
         yaml_layout = QHBoxLayout()
         yaml_layout.addWidget(QLabel("YAML file:"))
-        # NOTE: was hardcoded to a personal path (/opt/test_spec_code/fileinfo.yaml).
-        # Left blank by default -- use the "Browse" button, or set your own
-        # default here if you always keep configs in the same place.
-        self.yaml_pattern = QLineEdit("")
+        self.yaml_pattern = QLineEdit(os.path.join(script_dir, 'fileinfo.yaml'))
         yaml_layout.addWidget(self.yaml_pattern)
-        yaml_browse_button = QPushButton("Browse...")
-        yaml_browse_button.clicked.connect(self.browse_yaml_file)
-        yaml_layout.addWidget(yaml_browse_button)
+        yaml_browse = QPushButton('Browse YAML…')
+        yaml_browse.clicked.connect(self.select_yaml_file)
+        yaml_layout.addWidget(yaml_browse)
         file_layout.addLayout(yaml_layout)
         # Read yaml file button
         yread_button = QPushButton("Read YAML file")
@@ -259,7 +866,9 @@ class SpectroscopicReductionGUI(QMainWindow):
             dir_button = QPushButton("Browse...")
             dir_button.clicked.connect(self.select_directory)
         dir_layout.addWidget(self.dir_path)
-        #dir_layout.addWidget(dir_button)
+        dir_button = QPushButton('Browse…')
+        dir_button.clicked.connect(self.select_directory)
+        dir_layout.addWidget(dir_button)
         file_layout.addLayout(dir_layout)
         ## resource directory
         res_name_layout = QHBoxLayout()
@@ -271,7 +880,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         # Trim checkbox
         self.trim_check = QCheckBox("Trim images")
         self.trim_check.setChecked(True)
-        file_layout.addWidget(self.trim_check)
+        file_layout.addWidget(self.create_info_label('trim', self.trim_check, checkbox=True))
         
         # Spatial axis
         axis_layout = QHBoxLayout()
@@ -301,7 +910,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         file_layout.addWidget(read_button)
         
         layout.addWidget(file_group)
-        tab.setLayout(layout)
+        # The QWidget already owns its layout.
         self.tabs.addTab(tab, "File Selection")
 
     def select_directory(self):
@@ -310,21 +919,29 @@ class SpectroscopicReductionGUI(QMainWindow):
         if directory:
             self.dir_path.setText(directory)
             
-    def browse_yaml_file(self):
-        """Open a file picker for the reduction config YAML (fileinfo.yaml)."""
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Select reduction config YAML", "", "YAML files (*.yaml *.yml)"
-        )
+    def select_yaml_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Choose pipeline YAML', script_dir, 'YAML files (*.yaml *.yml);;All files (*)')
         if path:
             self.yaml_pattern.setText(path)
 
     def yread_files(self):
         yfile = str(self.yaml_pattern.text())
         print(" the yaml file ",yfile)
-        with open(yfile,'r') as file:
-            yamlfile = yaml.load(file,Loader=yaml.SafeLoader)
+        if not os.path.isfile(yfile):
+            QMessageBox.warning(self, 'YAML not found', f'Cannot find: {yfile}')
+            return
+        try:
+            with open(yfile, 'r', encoding='utf-8') as file:
+                yamlfile = yaml.safe_load(file)
+            if not isinstance(yamlfile, dict):
+                raise ValueError('YAML root must be a mapping.')
+        except (OSError, yaml.YAMLError, ValueError) as exc:
+            QMessageBox.critical(self, 'Invalid YAML', str(exc))
+            return
 
         self.workdir             = yamlfile["workdir"]
+        if not os.path.isabs(self.workdir):
+            self.workdir = os.path.normpath(os.path.join(os.path.dirname(yfile), self.workdir))
         self.biaspattern         = yamlfile["bias_pattern"]
         self.flatpattern         = yamlfile["continuum_lamp"]
         self.arcpattern          = yamlfile["arc_lamp"]["pattern"]
@@ -347,6 +964,11 @@ class SpectroscopicReductionGUI(QMainWindow):
         self.sci_name.setText(self.sciobj_name)
         self.arc_file.setText(self.arclampname)
         self.std_name_edit.setText(self.standstar_name)
+        self.slit.setCurrentText(str(yamlfile.get('slit', self.slit.currentText())))
+        self.grism.setCurrentText(str(yamlfile.get('grism', self.grism.currentText())))
+        self.trim_check.setChecked(str(yamlfile.get('trim', True)).lower() in ('true', '1', 'yes'))
+        self.spatial_axis.setCurrentText(str(yamlfile.get('spatial_axis', '0')))
+        self.log_message(f'Loaded YAML settings: {os.path.basename(yfile)}')
 
         if self.std_table.rowCount() == 0:
             self.std_table.setRowCount(1)
@@ -380,11 +1002,7 @@ class SpectroscopicReductionGUI(QMainWindow):
                 Std=self.std_pattern.text(),
                 Sci_name=self.sci_name.text(),
                 Std_name=self.std_name.text(),
-                trim=self.trim_check.isChecked(),
-                # instrument-specific trim box now comes from
-                # specred/instruments/<name>.yaml instead of being
-                # hardcoded in specred.io
-                trim_box=get_trim_box(load_instrument(self.instrument_name)),
+                trim=self.trim_check.isChecked()
             )
             
             # Update the file lists
@@ -433,7 +1051,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # Flat correction options
         options_layout = QHBoxLayout()
-        options_layout.addWidget(QLabel("Smoothing:"))
+        options_layout.addWidget(self.create_info_label('flat_smoothing', 'Smoothing:'))
         self.smooth_check = QCheckBox()
         self.smooth_check.setChecked(True)
         options_layout.addWidget(self.smooth_check)
@@ -451,7 +1069,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         flat_layout.addLayout(corrected_layout)
 
         options_layout = QHBoxLayout()
-        options_layout.addWidget(QLabel("Cosmic-ray correction:"))
+        options_layout.addWidget(self.create_info_label('cosmic_ray', 'Cosmic-ray correction:'))
         self.cosmic_corr = QCheckBox()
         self.cosmic_corr.setChecked(True)
         options_layout.addWidget(self.cosmic_corr)
@@ -463,50 +1081,44 @@ class SpectroscopicReductionGUI(QMainWindow):
         flat_layout.addWidget(flat_button)
         
         layout.addWidget(flat_group)
-        tab.setLayout(layout)
+        # The QWidget already owns its layout.
         self.tabs.addTab(tab, "Flat Correction")
 
     
     def perform_flat_correction(self):
-        """Perform flat field correction"""
+        """Normalize the continuum flat and show it in the integrated viewer."""
         try:
-            if not hasattr(self, 'flatin') or not self.flatin:
-                raise ValueError("Please read files first")
-            
-            self.log_message("Performing flat field correction...")
-            
-            # Call your flat_2 functions
-            flat_2.lamp_response(
-                self.master_flat_name.text(),
-                func=True,
-                smooth=self.smooth_check.isChecked(),
-                Saxis=sxs,
-                display=self.display_flat_check.isChecked()
-                
-            )
-            
-            self.lst = flat_2.flat_correction(self.flatin, self.corrected_flat_name.text(),cosmic_correction = self.cosmic_corr.isChecked())
-            self.log_message(f"Flat correction completed. Output: {self.lst}")
-            
-            # Update file lists after flat correction
-            self.sci_lst = [item for item in self.lst if f"{self.sciname}" in item]
-            self.std_lst = [item for item in self.lst if f"{self.stdname}" in item]
-            self.arclst = [item for item in self.lst if "LAMP" in item.upper()][0]
-            
-            self.log_message(f"Updated science files: {len(self.sci_lst)}")
-            self.log_message(f"Updated standard files: {len(self.std_lst)}")
-            self.log_message(f"Updated arc file: {self.arclst}")
-            SLIT = self.slit.currentText()
-            GRISM = self.grism.currentText()
-            print(f" the selected config is SLIT:{SLIT} and {GRISM}")
-            
-            # Enable next tab
+            if not getattr(self, 'flatin', None):
+                raise ValueError('Read and bias-correct the input frames first.')
+            master_path = self.master_flat_name.text().strip()
+            normalized_path = self.corrected_flat_name.text().strip()
+            if not master_path or not normalized_path:
+                raise ValueError('Specify master-flat and normalized-flat filenames.')
+            self.log_message('Preparing normalized continuum flat...')
+            normalized, response, raw_response = flat_2.lamp_response(
+                master_path, smooth=self.smooth_check.isChecked(), Saxis=sxs,
+                display=False, output=normalized_path, return_response=True)
+            self.log_message('Normalized flat saved: {}'.format(normalized_path))
+            if self.display_flat_check.isChecked():
+                # Do not open Matplotlib; the same PyQtGraph viewer handles all images.
+                frame_to_show = normalized if sxs == 0 else normalized.T
+                self.show_2d_view(frame_to_show, title='Normalized continuum flat: {}'.format(normalized_path))
+            self.log_message('Applying flat correction to {} frames...'.format(len(self.flatin)))
+            self.lst = flat_2.flat_correction(self.flatin, normalized_path,
+                cosmic_correction=self.cosmic_corr.isChecked())
+            self.sci_lst = [name for name in self.lst if self.sciname in name]
+            self.std_lst = [name for name in self.lst if self.stdname in name]
+            arcs = [name for name in self.lst if Path(name).name.lower().startswith('fc_com_')]
+            if not arcs:
+                arcs = [name for name in self.lst if 'lamp' in Path(name).name.lower()]
+            self.arclst = arcs[0] if arcs else None
+            self.log_message('Flat correction complete: {} science, {} standard, {} arc.'.format(
+                len(self.sci_lst), len(self.std_lst), len(arcs)))
             self.tabs.setTabEnabled(2, True)
-            
-        except Exception as e:
-            self.log_message(f"Error in flat correction: {str(e)}")
-            QMessageBox.critical(self, "Error", f"Flat correction failed: {str(e)}")
-            
+        except Exception as exc:
+            self.log_message('Flat correction failed: {}'.format(exc))
+            QMessageBox.critical(self, 'Flat correction', str(exc))
+
 
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
 #         APERTURE EXTRACTION             #
@@ -524,7 +1136,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         # Preview figure
         self.preview_figure = Figure()
         self.preview_canvas = FigureCanvas(self.preview_figure)
-        preview_layout.addWidget(self.preview_canvas)
+        # Preview is displayed in the persistent upper-right PyQtGraph viewer.
         
         # Preview controls
         preview_controls = QHBoxLayout()
@@ -539,13 +1151,13 @@ class SpectroscopicReductionGUI(QMainWindow):
         preview_controls.addWidget(self.preview_file_combo)
         
         # Guess value input
-        preview_controls.addWidget(QLabel("Guess Value:"))
+        preview_controls.addWidget(self.create_info_label('guess', 'Guess Value:'))
         self.preview_guess_input = QSpinBox()
         self.preview_guess_input.setRange(0, 2048)
         preview_controls.addWidget(self.preview_guess_input)
         
         # X Limit input
-        preview_controls.addWidget(QLabel("X Limit:"))
+        preview_controls.addWidget(self.create_info_label('xlim', 'X Limit:'))
         self.preview_xlim_input = QSpinBox()
         self.preview_xlim_input.setRange(0, 2048)
         self.preview_xlim_input.setValue(1500)
@@ -557,15 +1169,89 @@ class SpectroscopicReductionGUI(QMainWindow):
         preview_controls.addWidget(preview_btn)
         
         preview_layout.addLayout(preview_controls)
+        trace_controls = QHBoxLayout()
+        trace_controls.addWidget(self.create_info_label('bin_width', 'Bin width:'))
+        self.preview_bin_width = QSpinBox(); self.preview_bin_width.setRange(1, 300); self.preview_bin_width.setValue(20)
+        trace_controls.addWidget(self.preview_bin_width)
+        trace_controls.addWidget(self.create_info_label('ap_width', 'Aperture ±:'))
+        self.preview_ap_width = QSpinBox(); self.preview_ap_width.setRange(1, 100); self.preview_ap_width.setValue(6)
+        trace_controls.addWidget(self.preview_ap_width)
+        trace_controls.addWidget(self.create_info_label('sky_gap', 'Sky gap:'))
+        self.preview_sky_sep = QSpinBox(); self.preview_sky_sep.setRange(1, 100); self.preview_sky_sep.setValue(6)
+        trace_controls.addWidget(self.preview_sky_sep)
+        self.click_guess_btn = QPushButton('Pick Y on image')
+        self.click_guess_btn.setCheckable(True)
+        self.click_guess_btn.setToolTip('Enable, then left-click the spectrum on the image to choose the initial Y position')
+        trace_controls.addWidget(self.click_guess_btn)
+        preview_layout.addLayout(trace_controls)
+        self.live_trace_checkbox = QCheckBox('Live trace and extraction-region preview')
+        self.live_trace_checkbox.setChecked(True)
+        preview_layout.addWidget(self.live_trace_checkbox)
+        self.preview_status = QLabel('Select a file to inspect its trace')
+        self.preview_status.setObjectName('subtitle')
+        preview_layout.addWidget(self.preview_status)
+        self._preview_data = None
+        self._preview_path = None
+        self._preview_internal_update = False
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(350)
+        self._preview_timer.timeout.connect(self._update_live_trace)
+        self.preview_file_combo.currentIndexChanged.connect(self._preview_file_changed)
+        for control in (self.preview_guess_input, self.preview_xlim_input, self.preview_bin_width,
+                        self.preview_ap_width, self.preview_sky_sep):
+            control.valueChanged.connect(self._preview_parameter_changed)
+        self.live_trace_checkbox.toggled.connect(self._preview_parameter_changed)
+        self.click_guess_btn.toggled.connect(self._guess_mode_changed)
         layout.addWidget(preview_group)
         
+        # Shared extraction settings; valid for both science and standard files.
+        common = QGroupBox('Trace / Extraction configuration')
+        common_layout = QVBoxLayout()
+        common_row1 = QHBoxLayout()
+        common_row1.addWidget(self.create_info_label('search_width', 'Search ±'))
+        self.ap_search_width = QSpinBox()
+        self.ap_search_width.setRange(3, 100)
+        self.ap_search_width.setValue(12)
+        common_row1.addWidget(self.ap_search_width)
+        common_row1.addWidget(self.create_info_label('max_shift', 'Max shift'))
+        self.ap_max_shift = QSpinBox()
+        self.ap_max_shift.setRange(1, 100)
+        self.ap_max_shift.setValue(8)
+        common_row1.addWidget(self.ap_max_shift)
+        common_row1.addWidget(self.create_info_label('sky_width', 'Sky width'))
+        self.ap_sky_width = QSpinBox()
+        self.ap_sky_width.setRange(2, 100)
+        self.ap_sky_width.setValue(7)
+        common_row1.addWidget(self.ap_sky_width)
+        common_row2 = QHBoxLayout()
+        common_row2.addWidget(self.create_info_label('sky_degree', 'Sky polynomial degree'))
+        self.ap_sky_degree = QSpinBox()
+        self.ap_sky_degree.setRange(0, 2)
+        self.ap_sky_degree.setValue(0)
+        common_row2.addWidget(self.ap_sky_degree)
+        common_row2.addWidget(self.create_info_label('psf_sigma', 'PSF sigma (px)'))
+        self.ap_profile_sigma = QDoubleSpinBox()
+        self.ap_profile_sigma.setRange(0.5, 20.)
+        self.ap_profile_sigma.setValue(2.5)
+        self.ap_profile_sigma.setSingleStep(0.25)
+        common_row2.addWidget(self.ap_profile_sigma)
+        common_layout.addLayout(common_row1)
+        common_layout.addLayout(common_row2)
+        common.setLayout(common_layout)
+        layout.addWidget(common)
+
+        for control in (self.ap_search_width, self.ap_max_shift, self.ap_sky_width,
+                        self.ap_sky_degree, self.ap_profile_sigma):
+            control.valueChanged.connect(self._preview_parameter_changed)
+
         # 2. Science Object Section
         sci_group = QGroupBox("Science Object Extraction")
         sci_layout = QVBoxLayout(sci_group)
         
         # Science files table with Combine ID column
         self.sci_table = QTableWidget(0, 8)  # 8 columns
-        self.sci_table.setHorizontalHeaderLabels(["File", "Guess Value", "X Limit", "Nbin","Ap width","Sky sep", "Method", "Combine ID"])   #2207
+        self.sci_table.setHorizontalHeaderLabels(["File", "Guess Value", "X Limit", "Bin width","Ap width","Sky sep", "Method", "Combine ID"])   #2207
         self.sci_table.horizontalHeader().setStretchLastSection(True)
         sci_layout.addWidget(self.sci_table)
         
@@ -589,7 +1275,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         sci_controls.addWidget(combine_sci_btn)
         
         # Combine Method selection
-        sci_controls.addWidget(QLabel("Combine Method:"))
+        sci_controls.addWidget(self.create_info_label('combine_method', 'Combine Method:'))
         self.sci_combine_method = QComboBox()
         self.sci_combine_method.addItems(["mean", "invvar", "median"])
         self.sci_combine_method.setCurrentIndex(0)
@@ -603,9 +1289,12 @@ class SpectroscopicReductionGUI(QMainWindow):
         std_layout = QVBoxLayout(std_group)
         
         self.std_table = QTableWidget(0, 6)  # 6 columns
-        self.std_table.setHorizontalHeaderLabels(["File", "Guess Value", "X Limit", "Nbin", "Method", "Combine ID"])
+        self.std_table.setHorizontalHeaderLabels(["File", "Guess Value", "X Limit", "Bin width", "Method", "Combine ID"])
+        self._add_table_help(self.std_table, {1:'guess', 2:'xlim', 3:'bin_width', 4:'extract_method', 5:'combine_id'})
         self.std_table.horizontalHeader().setStretchLastSection(True)
         std_layout.addWidget(self.std_table)
+        self.sci_table.itemChanged.connect(lambda item: self._table_parameter_changed('science', item))
+        self.std_table.itemChanged.connect(lambda item: self._table_parameter_changed('standard', item))
         
         # Standard controls
         std_controls = QHBoxLayout()
@@ -623,7 +1312,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         combine_std_btn.clicked.connect(lambda: self.combine_spectra('standard', group=self.std_combine_group.currentText()))
         std_controls.addWidget(combine_std_btn)
         
-        std_controls.addWidget(QLabel("Combine Method:"))
+        std_controls.addWidget(self.create_info_label('combine_method', 'Combine Method:'))
         self.std_combine_method = QComboBox()
         self.std_combine_method.addItems(["mean", "invvar", "median"])
         self.std_combine_method.setCurrentIndex(0)
@@ -635,153 +1324,238 @@ class SpectroscopicReductionGUI(QMainWindow):
         self.tabs.addTab(tab, "Aperture Extraction")
 
 
-    def aperture_extract(self, sci_lst, otype="src", arcfile=None, sourcename=None, 
-                        initial_guess=500, method="sum", xlim=1500, nbin=7,apw=6,skysep=6,
-                        display_trace=True, display_extract=True):
-        """Wrapper for aperture extraction function with GUI integration"""
-        AP_data = []
-        source_am = []
-        ARC_data = []
-        
-        for idx, sciff in enumerate(np.unique(sci_lst)):
-            self.log_message(f'Processing file {sciff}')
-            self.log_message(f'Using guess value: {initial_guess}')
-            
-            scif = ccdproc.CCDData.read(sciff, unit="adu")
-            scif = ccdproc.CCDData(
-                np.nan_to_num(scif.data, copy=True, nan=0.0, posinf=0.0, neginf=0.0),
-                unit="adu",
-                header=scif.header
-            )
-            if otype=="src":
-                self.sci_mjd = round((float(scif.header["JD"]) - 2400000.5),5)      ## taking MJD value while saving the final csv file
-                print("sci mjd = ",int(self.sci_mjd))
-            
-            Airmass = airmass.Airmass(sciff, sourcename)
-            source_am.append(Airmass)
-            name = f"A_"+sciff
-            
-            # Trace function
-            sci_tr = aperture.trfunc(
-                scif,
-                nbins=int(nbin),
-                window=20,
-                guess=initial_guess,
-                Saxis=sxs,
-                Xlim=int(xlim),
-                display=display_trace,
-                otype=otype,
-                filename=name
-            )
-            #print("done JJ 0")
-            # Boxcar extraction
-            sci_ex, sky_sci = aperture.boxfunc(
-                scif,
-                sci_tr,
-                Saxis=sxs,
-                display=display_extract,
-                otype=otype,
-                apwidth=apw,
-                skysep=skysep,
-                filename=name,
-                airmass=Airmass,
-                method=method
-            )
-            #print("done JJ 1")
-            #print(f"{name} \n hdr {scif.header}")
-            Sci_ex = Spectrum1D(
-                flux=(sci_ex.flux - sky_sci.flux),
-                spectral_axis=sci_ex.spectral_axis,
-                uncertainty=StdDevUncertainty(sci_ex.uncertainty.array),
-                meta={'header':scif.header}
-            )
-            #print("done JJ 2")
-            AP_data.append(Sci_ex)
-            scif.header["airmass"] = Airmass
-            name = name.replace(".fit", "").replace(".fits", "")
-            fits.writeto(name+".fits", Sci_ex.flux.value, scif.header, overwrite=True)
-            self.newher = scif.header
-            #print("done JJ 3")
-            if otype == "src" and idx == 0:
-                if arcfile is None:
-                    self.log_message("Warning: No arcfile provided for aperture extraction")
-                else:
-                    arcf = ccdproc.CCDData.read(arcfile, unit="adu")
-                    arcf = ccdproc.CCDData(
-                        np.nan_to_num(arcf.data, copy=True, nan=0.0, posinf=0.0, neginf=0.0),
-                        unit="adu",
-                        header=scif.header
-                    )
-                    sciarc_ex, _ = aperture.BoxcarExtract(
-                        arcf,
-                        sci_tr,
-                        Saxis=sxs,
-                        filename=self.lst[2],
-                        log_file=None,
-                        method=method
-                    )
-                    ARC_data.append(sciarc_ex)
-                    arcname = f"A_ap_arc_"+arcfile
-                    fits.writeto(arcname, sciarc_ex.flux.value, arcf.header, overwrite=True)
-        #print("done JJ 4")
-        if otype == "src":
+    def aperture_extract(self, sci_lst, otype='src', arcfile=None, sourcename=None,
+                         initial_guess=500, method='sum', xlim=1500, nbin=20, apw=6,
+                         skysep=6, display_trace=True, display_extract=True,
+                         bin_width=None, search_halfwidth=12, max_shift=8, skywidth=7,
+                         skydeg=0, profile_sigma=2.5):
+        """Extract and stage interactive viewer records without opening new figures."""
+        AP_data, source_am, ARC_data = [], [], []
+        for idx, sciff in enumerate(sci_lst):
+            self.log_message('Extracting {}'.format(sciff))
+            scif = ccdproc.CCDData.read(sciff, unit='adu')
+            # Do not replace NaNs by zeros: masked/bad pixels must be excluded.
+            jd = scif.header.get('JD')
+            if jd is not None and otype == 'src':
+                self.sci_mjd = round(float(jd)-2400000.5, 5)
+            am = airmass.Airmass(sciff, sourcename)
+            source_am.append(am)
+            name = 'A_'+os.path.basename(sciff)
+            trace, details = aperture.trfunc(scif, filename=name, nbins=int(nbin),
+                window=search_halfwidth, guess=initial_guess, Saxis=sxs, Xlim=xlim,
+                bin_width=(bin_width if bin_width is not None else int(nbin)),
+                max_shift=max_shift, display=False, return_details=True)
+            raw, sky, arrays = aperture.boxfunc(scif, trace, filename=name,
+                airmass=am, apwidth=apw, skysep=skysep, skywidth=skywidth,
+                skydeg=skydeg, Saxis=sxs, method=method, otype=otype,
+                profile_sigma=profile_sigma, display=False, return_arrays=True)
+            extracted = Spectrum1D(flux=(raw.flux-sky.flux), spectral_axis=raw.spectral_axis,
+                uncertainty=StdDevUncertainty(raw.uncertainty.array), meta={'header': scif.header})
+            AP_data.append(extracted)
+            hdr = scif.header.copy()
+            if am is not None: hdr['AIRMASS'] = float(am)
+            fits.writeto(Path(name).with_suffix('.fits'), extracted.flux.value, hdr, overwrite=True)
+            image = np.asarray(scif.data, dtype=float)
+            if sxs == 1: image = image.T
+            self._add_aperture_views(image, trace, details, arrays, apw, skysep, skywidth,
+                                     os.path.basename(sciff))
+            if otype == 'src' and idx == 0 and arcfile:
+                arcf = ccdproc.CCDData.read(arcfile, unit='adu')
+                arc_raw, _, _ = aperture.BoxcarExtract(arcf, trace, filename='arc_'+name,
+                    Saxis=sxs, method='sum', otype='lamp', apwidth=apw,
+                    skysep=skysep, skywidth=skywidth, display=False, return_arrays=True)
+                ARC_data.append(arc_raw)
+                fits.writeto('A_ap_arc_'+os.path.basename(arcfile), arc_raw.flux.value,
+                             arcf.header, overwrite=True)
+        if otype == 'src':
             return AP_data, source_am, ARC_data
-        else:
-            return AP_data, source_am
+        return AP_data, source_am
 
-        
-    def preview_selected_image(self):
-        """Preview the selected image with current parameters"""
+    def _tab_changed(self, index):
+        if index == 2 and getattr(self, '_preview_data', None) is not None:
+            self._schedule_trace_preview()
+        elif self.tabs.tabText(index) == 'Output':
+            self.plot_final_spectrum()
+
+    def _guess_mode_changed(self, enabled):
+        self.click_guess_btn.setText('Click spectrum in viewer…' if enabled else 'Pick Y on image')
+        if enabled:
+            self.preview_status.setText('Click on the 2D image to set the spatial Y guess')
+
+    def _viewer_mouse_clicked(self, event):
+        """Use left mouse click on a 2D preview to update the spatial guess."""
+        if not self.click_guess_btn.isChecked() or event.button() != Qt.LeftButton:
+            return
+        if self.tabs.currentIndex() != 2 or self._viewer_kind != 'image':
+            return
+        vb = self.viewer_plot.getViewBox()
+        if not vb.sceneBoundingRect().contains(event.scenePos()):
+            return
+        point = vb.mapSceneToView(event.scenePos())
+        x, y = point.x(), point.y()
+        if self._preview_data is None:
+            return
+        ny, nx = self._preview_data.shape
+        if not (0 <= x < nx and 0 <= y < ny):
+            return
+        self.preview_guess_input.setValue(int(round(y)))
+        self.click_guess_btn.setChecked(False)
+        event.accept()
+
+    def _preview_row(self):
+        """Locate selected preview file in the science or standard table."""
+        name = self.preview_file_combo.currentText()
+        for group, files, table in (('science', self.sci_lst, self.sci_table),
+                                    ('standard', self.std_lst, self.std_table)):
+            for row, path in enumerate(files):
+                if os.path.basename(path) == name:
+                    return group, row, table
+        return None, None, None
+
+    def _preview_file_changed(self, *_):
+        self._preview_data = None
+        self._preview_path = None
+        group, row, table = self._preview_row()
+        if table is not None and row < table.rowCount():
+            self._preview_internal_update = True
+            try:
+                for col, widget in ((1, self.preview_guess_input), (2, self.preview_xlim_input),
+                                    (3, self.preview_bin_width)):
+                    item = table.item(row, col)
+                    if item is not None:
+                        try: widget.setValue(int(item.text()))
+                        except ValueError: pass
+                if group == 'science':
+                    for col, widget in ((4, self.preview_ap_width), (5, self.preview_sky_sep)):
+                        item = table.item(row, col)
+                        if item is not None:
+                            try: widget.setValue(int(item.text()))
+                            except ValueError: pass
+            finally:
+                self._preview_internal_update = False
+        if self.preview_file_combo.currentText():
+            self.preview_selected_image()
+
+    def _table_parameter_changed(self, group, item):
+        if self._preview_internal_update or item.column() not in (1, 2, 3, 4, 5):
+            return
+        selected_group, row, _ = self._preview_row()
+        if selected_group != group or row != item.row():
+            return
+        mapping = {1: self.preview_guess_input, 2: self.preview_xlim_input,
+                   3: self.preview_bin_width}
+        if group == 'science':
+            mapping.update({4: self.preview_ap_width, 5: self.preview_sky_sep})
+        widget = mapping.get(item.column())
+        if widget is None:
+            return
+        try: value = int(item.text())
+        except ValueError: return
+        self._preview_internal_update = True
+        try: widget.setValue(value)
+        finally: self._preview_internal_update = False
+        self._schedule_trace_preview()
+
+    def _preview_parameter_changed(self, *_):
+        if self._preview_internal_update:
+            return
+        group, row, table = self._preview_row()
+        if table is not None and row < table.rowCount():
+            columns = {1: self.preview_guess_input, 2: self.preview_xlim_input,
+                       3: self.preview_bin_width}
+            if group == 'science':
+                columns.update({4: self.preview_ap_width, 5: self.preview_sky_sep})
+            self._preview_internal_update = True
+            try:
+                for col, widget in columns.items():
+                    item = table.item(row, col)
+                    if item is not None:
+                        item.setText(str(widget.value()))
+            finally:
+                self._preview_internal_update = False
+        self._schedule_trace_preview()
+
+    def _schedule_trace_preview(self):
+        if not hasattr(self, 'viewer_plot') or not self.preview_file_combo.currentText():
+            return
+        self._preview_timer.start()
+
+    def _get_preview_image(self):
+        name = self.preview_file_combo.currentText()
+        if not name:
+            return None
+        # Resolve against the current reduction folder, where processed frames reside.
+        full_path = name if os.path.isabs(name) else os.path.join(os.getcwd(), name)
+        if self._preview_path != full_path:
+            with fits.open(full_path, memmap=False) as hdul:
+                data = next((hdu.data for hdu in hdul if hdu.data is not None), None)
+                if data is None:
+                    raise ValueError('FITS file contains no image')
+                frame = np.array(data, dtype=float, copy=True)
+            if frame.ndim != 2:
+                raise ValueError('Expected a 2D FITS image')
+            self._preview_data = frame if sxs == 0 else frame.T
+            self._preview_path = full_path
+        return self._preview_data
+
+    def _update_live_trace(self):
+        """Recompute only the trace; no spectral extraction or file writing."""
+        if self.tabs.currentIndex() != 2:
+            return
         try:
-            filename = self.preview_file_combo.currentText()
-            if not filename:
+            image = self._get_preview_image()
+            if image is None:
                 return
-                
+            ny, nx = image.shape
+            self.preview_guess_input.setMaximum(max(0, ny-1))
+            self.preview_xlim_input.setMaximum(nx)
+            xlim = max(6, min(nx, self.preview_xlim_input.value()))
             guess = self.preview_guess_input.value()
-            xlim = self.preview_xlim_input.value()
-            
-            # Read and display the image
-            with fits.open(filename) as hdul:
-                data = hdul[0].data if hdul[0].data is not None else hdul[1].data
-                
-            self.preview_figure.clear()
-            ax = self.preview_figure.add_subplot(111)
-            
-            # Display with reasonable contrast
-            vmin = np.nanpercentile(data, 5)
-            vmax = np.nanpercentile(data, 95)
-            
-            ax.imshow(data, origin='lower', aspect='auto', 
-                     cmap='gray', vmin=vmin, vmax=vmax)
-            ax.set_title(os.path.basename(filename))
-            
-            # Show guess line
-            ax.axhline(y=guess, color='r', linestyle='--', alpha=0.7)
-            ax.text(100, guess+80, f'Guess: {guess}', color='r',fontsize=9,
-                   bbox=dict(facecolor='white', alpha=0.7))
-            
-            # Show x limit
-            if xlim > 0:
-                ax.axvline(x=xlim, color='b', linestyle=':', alpha=0.7)
-                ax.text(xlim+10, 10, f'X Limit: {xlim}', color='b',
-                       bbox=dict(facecolor='white', alpha=0.7))
-            
-            self.preview_canvas.draw()
-            #### 2607
-            fig_apwidth,ax_apwidth = pllt.subplots(figsize=(7,4))
-            line = np.sum(data[:,500:550],axis=1)
-            ax_apwidth.plot(line,color="r")
-            ax_apwidth.set_xlabel("dispersion axis")
-            pllt.show()
-        except Exception as e:
-            self.log_message(f"Error previewing image: {str(e)}")
+            self.show_2d_view(image, os.path.basename(self._preview_path), guess=guess, xlim=xlim)
+            self.preview_status.setText('X = 0–{}, selected Y = {}. Trace not calculated.'.format(xlim-1, guess))
+            if not self.live_trace_checkbox.isChecked():
+                return
+            trace, details = aperture.trace_sloped(image, guess=guess, Xlim=xlim,
+                bin_width=self.preview_bin_width.value(),
+                search_halfwidth=self.ap_search_width.value(), max_shift=self.ap_max_shift.value(),
+                poly_order=1, Saxis=0, return_details=True)
+            x = np.arange(len(trace))
+            self.viewer_plot.plot(x, trace, pen=pg.mkPen('#58e5d6', width=2), connect='finite')
+            a, gap, skyw = self.preview_ap_width.value(), self.preview_sky_sep.value(), self.ap_sky_width.value()
+            for offset, color in ((-a, '#65c9f5'), (a, '#65c9f5'),
+                                  (-a-gap, '#ffbf69'), (-a-gap-skyw, '#ffbf69'),
+                                  (a+gap, '#ffbf69'), (a+gap+skyw, '#ffbf69')):
+                self.viewer_plot.plot(x, trace+offset, pen=pg.mkPen(color, width=1), connect='finite')
+            accepted = details['accepted'] & np.isfinite(details['bin_y'])
+            if np.any(accepted):
+                self.viewer_plot.addItem(pg.ScatterPlotItem(
+                    x=details['bin_x'][accepted], y=details['bin_y'][accepted],
+                    pen=None, brush=pg.mkBrush('#fff09b'), size=5))
+            self.preview_status.setText('Trace OK | accepted bins: {} / {} | Y at centre: {:.2f}'.format(
+                np.count_nonzero(accepted), len(accepted), trace[len(trace)//2]))
+        except Exception as exc:
+            self.preview_status.setText('Trace preview: {}'.format(exc))
+            self.statusBar().showMessage('Trace preview: {}'.format(exc))
 
+    def preview_selected_image(self):
+        """Load image and show the live trace in the upper-right viewer."""
+        try:
+            self._get_preview_image()
+            self._preview_timer.stop()
+            self._update_live_trace()
+        except Exception as exc:
+            self.log_message('Preview error: {}'.format(exc))
 
     def update_file_lists(self):
         """Update file lists with Combine ID selection"""
+        self._aperture_views = []
+        self._aperture_view_index = -1
+        self._update_view_navigation()
+        self.preview_file_combo.blockSignals(True)
         self.preview_file_combo.clear()
         all_files = self.sci_lst + self.std_lst + ([self.arclst] if self.arclst else [])
         self.preview_file_combo.addItems([os.path.basename(f) for f in all_files])
+        self.preview_file_combo.blockSignals(False)
         
         # Science table
         self.sci_table.setRowCount(len(self.sci_lst))
@@ -812,7 +1586,7 @@ class SpectroscopicReductionGUI(QMainWindow):
             
             # Method combo
             method_combo = QComboBox()
-            method_combo.addItems(["sum", "average"])
+            method_combo.addItems(["sum", "variance"])
             self.sci_table.setCellWidget(i, 6, method_combo)
             
             # Combine ID combo
@@ -843,7 +1617,7 @@ class SpectroscopicReductionGUI(QMainWindow):
             
             # Method combo
             method_combo = QComboBox()
-            method_combo.addItems(["sum", "average"])
+            method_combo.addItems(["sum", "variance"])
             self.std_table.setCellWidget(i, 4, method_combo)
             
             # Combine ID combo
@@ -854,6 +1628,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         self.sci_table.resizeColumnsToContents()
         self.std_table.resizeColumnsToContents()
+        self._preview_file_changed()
 
     def extract_science(self):
         """Perform aperture extraction for science objects"""
@@ -866,6 +1641,10 @@ class SpectroscopicReductionGUI(QMainWindow):
             
             self.sci_results = []  # Initialize SCIdata
             self.sci_airmass = []
+            self.combined_spectra['SCI'].clear()
+            self.W_sci_groups, self.W_std_groups, self.final_groups = {}, {}, {}
+            self.flux_calibrated = self.final_spec = None
+            self.flux_cal_btn.setEnabled(False)
             
             for row in range(self.sci_table.rowCount()):
                 filename = self.sci_lst[row]
@@ -889,6 +1668,11 @@ class SpectroscopicReductionGUI(QMainWindow):
                     xlim=xlim,
                     apw =apw,
                     skysep = skysep,
+                    search_halfwidth=self.ap_search_width.value(),
+                    max_shift=self.ap_max_shift.value(),
+                    skywidth=self.ap_sky_width.value(),
+                    skydeg=self.ap_sky_degree.value(),
+                    profile_sigma=self.ap_profile_sigma.value(),
                     display_trace=True,
                     display_extract=True
                 )
@@ -920,6 +1704,10 @@ class SpectroscopicReductionGUI(QMainWindow):
             
             self.STDdata = []  # Initialize STDdata
             self.std_airmass = []
+            self.combined_spectra['STD'].clear()
+            self.W_sci_groups, self.W_std_groups, self.final_groups = {}, {}, {}
+            self.flux_calibrated = self.final_spec = None
+            self.flux_cal_btn.setEnabled(False)
             #print(f" Table = ,{self.std_table.items()}" )
 
             #print(f" method = ,{self.std_table.cellWidget(0, 4).currentText()},,{self.std_table.cellWidget(1, 4).currentText()}" )
@@ -945,6 +1733,13 @@ class SpectroscopicReductionGUI(QMainWindow):
                     method=str(method),
                     xlim=xlim,
                     nbin=nbb,
+                    apw=self.preview_ap_width.value(),
+                    skysep=self.preview_sky_sep.value(),
+                    search_halfwidth=self.ap_search_width.value(),
+                    max_shift=self.ap_max_shift.value(),
+                    skywidth=self.ap_sky_width.value(),
+                    skydeg=self.ap_sky_degree.value(),
+                    profile_sigma=self.ap_profile_sigma.value(),
                     display_trace=True,
                     display_extract=True
                 )
@@ -990,6 +1785,7 @@ class SpectroscopicReductionGUI(QMainWindow):
 
             # Group spectra by Combine ID
             grouped_data = {}
+            grouped_rows = {}
             for i, spec in enumerate(data):
                 if i < table.rowCount():
                     try:
@@ -999,6 +1795,7 @@ class SpectroscopicReductionGUI(QMainWindow):
                         if combine_id not in grouped_data:
                             grouped_data[combine_id] = []
                         grouped_data[combine_id].append(spec)
+                        grouped_rows.setdefault(combine_id, []).append(i)
                     except Exception as e:
                         self.log_message(f"Error processing row {i}: {str(e)}")
                         continue
@@ -1006,8 +1803,10 @@ class SpectroscopicReductionGUI(QMainWindow):
             # Process selected group(s)
             if group == "All":
                 # Process all groups
+                self.combined_spectra[prefix].clear()
                 for gid, specs in grouped_data.items():
                     combined = self.combine_spectrum1d_stack(specs, method=method)
+                    self._store_group_metadata(combined, spec_type, gid, grouped_rows[gid], method)
                     self.combined_spectra[prefix][gid] = combined
                     print(f"combining for {gid}")
                     self._save_combined_spectrum(combined, spec_type, gid)
@@ -1016,6 +1815,7 @@ class SpectroscopicReductionGUI(QMainWindow):
                 if group not in grouped_data:
                     raise ValueError(f"No {spec_type} spectra in group {group}")
                 combined = self.combine_spectrum1d_stack(grouped_data[group], method=method)
+                self._store_group_metadata(combined, spec_type, group, grouped_rows[group], method)
                 self.combined_spectra[prefix][group] = combined
                 self._save_combined_spectrum(combined, spec_type, group)
 
@@ -1028,12 +1828,23 @@ class SpectroscopicReductionGUI(QMainWindow):
                 setattr(self, 'comb_STD', self.combined_spectra['STD'][first_group])
 
             self.log_message(f"Combined {len(data)} {spec_type} spectra (Group {group})")
+            self.W_sci_groups, self.W_std_groups = {}, {}
+            self.final_groups = {}
+            self.flux_calibrated = self.final_spec = None
+            self.flux_cal_btn.setEnabled(False)
             self.plot_combined_spectrum(spec_type, group)
 
         except Exception as e:
             error_msg = f"Error combining {spec_type} group {group}: {str(e)}"
             self.log_message(error_msg)
             QMessageBox.critical(self, "Error", error_msg)
+
+    def _store_group_metadata(self, spectrum, spec_type, group_id, rows, method):
+        files, am = (self.sci_lst, self.sci_airmass) if spec_type == 'science' else (self.std_lst, self.std_airmass)
+        values = np.asarray([am[i] for i in rows], dtype=float)
+        if not np.all(np.isfinite(values) & (values > 0)):
+            raise ValueError(f'Invalid airmass in {spec_type} group {group_id}')
+        spectrum.meta.update(group_id=group_id, input_files=[str(files[i]) for i in rows], airmass=float(np.mean(values)), combine_method=method)
 
     def _save_combined_spectrum(self, spectrum, spec_type, group_id):
         """Save combined spectrum to FITS file with proper naming and headers, 
@@ -1140,7 +1951,7 @@ class SpectroscopicReductionGUI(QMainWindow):
     
     def combine_flux_arrays(self, flux_stack, fluxerr_stack, method="invvar"):
         """Combine flux arrays using specified method"""
-        mask = ~np.isfinite(flux_stack) | ~np.isfinite(fluxerr_stack)
+        mask = ~np.isfinite(flux_stack) | ~np.isfinite(fluxerr_stack) | (fluxerr_stack <= 0)
         flux_stack = np.where(mask, np.nan, flux_stack)
         fluxerr_stack = np.where(mask, np.nan, fluxerr_stack)
         
@@ -1154,21 +1965,17 @@ class SpectroscopicReductionGUI(QMainWindow):
             combined_flux = np.divide(weighted_flux, sum_weights, 
                                     out=np.full_like(weighted_flux, np.nan), 
                                     where=sum_weights>0)
-            combined_fluxerr = np.sqrt(1.0 / sum_weights)
+            combined_fluxerr = np.sqrt(np.divide(1.0, sum_weights,
+                                                  out=np.full_like(sum_weights, np.nan), where=sum_weights > 0))
         
         elif method == "mean":
-            # For mean, use error propagation for weighted mean
-            weights = 1.0 / np.square(fluxerr_stack)
-            weights[~np.isfinite(weights)] = 0.0
-            
-            weighted_flux = np.nansum(flux_stack * weights, axis=0)
-            sum_weights = np.nansum(weights, axis=0)
-            
-            combined_flux = np.divide(weighted_flux, sum_weights,
-                                    out=np.full_like(weighted_flux, np.nan),
-                                    where=sum_weights>0)
-            combined_fluxerr = np.sqrt(np.nansum(weights**2 * fluxerr_stack**2, axis=0)) / sum_weights
-        
+            valid = np.isfinite(flux_stack) & np.isfinite(fluxerr_stack) & (fluxerr_stack >= 0)
+            n = valid.sum(axis=0)
+            combined_flux = np.divide(np.nansum(np.where(valid, flux_stack, 0.0), axis=0), n,
+                                      out=np.full(flux_stack.shape[1:], np.nan), where=n > 0)
+            combined_fluxerr = np.divide(np.sqrt(np.sum(np.where(valid, fluxerr_stack**2, 0.0), axis=0)), n,
+                                         out=np.full(flux_stack.shape[1:], np.nan), where=n > 0)
+
         elif method == "median":
             # For median, use median absolute deviation scaled by input errors
             combined_flux = np.nanmedian(flux_stack, axis=0)
@@ -1191,23 +1998,14 @@ class SpectroscopicReductionGUI(QMainWindow):
 
         return combined_flux, combined_fluxerr
 
-    def plot_combined_spectrum(self, spec_type, group="All"):
-        """Plot combined spectrum with group info"""
-        attr_name = f'comb_{spec_type.upper()}_group{group}'
-        if hasattr(self, attr_name):
-            combined_spec = getattr(self, attr_name)
-            self.preview_figure.clear()
-            ax = self.preview_figure.add_subplot(111)
-            ax.plot(combined_spec.spectral_axis, combined_spec.flux)
-            ax.set_title(f'Combined {spec_type.capitalize()} (Group {group})')
-            ax.set_xlabel('Pixel')
-            ax.set_ylabel('Counts')
-            self.preview_canvas.draw()
-
-
-#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
-#        WAVELENGTH CORRECTION            #
-#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#
+    def plot_combined_spectrum(self, spec_type, group='All'):
+        key = 'SCI' if spec_type == 'science' else 'STD'
+        groups = getattr(self, 'combined_spectra', {}).get(key, {})
+        if not groups:
+            return
+        selected = list(groups) if group == 'All' else [group] if group in groups else []
+        if selected:
+            self._diagnostic_views([dict(title=f'Combined {spec_type} | group {gid}', xlabel='Pixel', ylabel=f'Flux ({groups[gid].flux.unit})', series=[(groups[gid].spectral_axis.value, groups[gid].flux.value, f'Group {gid}', '#50c7dd', False)]) for gid in selected])
 
     def setup_spectral_calibration_tab(self):
         """Tab for spectral calibration with interactive steps"""
@@ -1220,7 +2018,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # ===== 1. Arc Line File Selection =====
         arc_layout = QHBoxLayout()
-        arc_layout.addWidget(QLabel("Arc Line File:"))
+        arc_layout.addWidget(self.create_info_label('arc_file', 'Arc Line File:'))
 
         # User input for filename
         self.arc_file = QLineEdit()
@@ -1275,23 +2073,23 @@ class SpectroscopicReductionGUI(QMainWindow):
         id_params_layout = QHBoxLayout()
         id_params_layout.addWidget(QLabel("Func"))
         self.line_func = QComboBox()
-        self.line_func.addItems(["spline","linear","slinear","cubic","legendre","polyfit","zero",'quadratic'])
+        self.line_func.addItems(['chebyshev'])
         self.line_func.setCurrentIndex(0)
         id_params_layout.addWidget(self.line_func)
 
-        id_params_layout.addWidget(QLabel("Deg:"))
+        id_params_layout.addWidget(self.create_info_label('poly_degree', 'Deg:'))
         self.deg_val = QSpinBox()
-        self.deg_val.setRange(1, 100)
+        self.deg_val.setRange(1, 20)
         self.deg_val.setValue(3)
         id_params_layout.addWidget(self.deg_val)
 
-        id_params_layout.addWidget(QLabel("Search Width:"))
+        id_params_layout.addWidget(self.create_info_label('match_tolerance', 'Match tolerance (Å):'))
         self.search_width = QSpinBox()
         self.search_width.setRange(1, 100)
         self.search_width.setValue(10)
         id_params_layout.addWidget(self.search_width)
         
-        id_params_layout.addWidget(QLabel("Threshold:"))
+        id_params_layout.addWidget(self.create_info_label('peak_threshold', 'Peak percentile (fraction):'))
         self.threshold = QDoubleSpinBox()
         self.threshold.setRange(0.1, 1.0)
         self.threshold.setSingleStep(0.01)
@@ -1319,13 +2117,13 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # First refinement
         refine1_layout = QHBoxLayout()
-        refine1_layout.addWidget(QLabel("Width:"))
+        refine1_layout.addWidget(self.create_info_label('match_tolerance', 'Tolerance (Å):'))
         self.refine_width = QSpinBox()
         self.refine_width.setRange(1, 50)
         self.refine_width.setValue(10)
         refine1_layout.addWidget(self.refine_width)
         
-        refine1_layout.addWidget(QLabel("Threshold:"))
+        refine1_layout.addWidget(self.create_info_label('peak_threshold', 'Peak percentile:'))
         self.refine_threshold = QDoubleSpinBox()
         self.refine_threshold.setRange(0.1, 1.0)
         self.refine_threshold.setSingleStep(0.01)
@@ -1340,13 +2138,13 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # Final refinement
         refine2_layout = QHBoxLayout()
-        refine2_layout.addWidget(QLabel("Width:"))
+        refine2_layout.addWidget(QLabel("Tolerance (Å):"))
         self.final_refine_width = QSpinBox()
         self.final_refine_width.setRange(1, 50)
         self.final_refine_width.setValue(10)
         refine2_layout.addWidget(self.final_refine_width)
         
-        refine2_layout.addWidget(QLabel("Threshold:"))
+        refine2_layout.addWidget(QLabel("Peak percentile:"))
         self.final_refine_threshold = QDoubleSpinBox()
         self.final_refine_threshold.setRange(0.1, 1.0)
         self.final_refine_threshold.setSingleStep(0.01)
@@ -1373,6 +2171,42 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         layout.addWidget(spec_group)
         self.tabs.addTab(tab, "Spectral Calibration")
+        self._arc_stage = 0
+        self._arc_preview_timer = QTimer(self)
+        self._arc_preview_timer.setSingleShot(True)
+        self._arc_preview_timer.timeout.connect(self._refresh_arc_preview)
+        for widget in (self.line_func, self.deg_val, self.search_width, self.threshold):
+            signal = widget.currentTextChanged if isinstance(widget, QComboBox) else widget.valueChanged
+            signal.connect(lambda *_: self._arc_parameters_changed(1))
+        for widget in (self.refine_width, self.refine_threshold):
+            widget.valueChanged.connect(lambda *_: self._arc_parameters_changed(2))
+        for widget in (self.final_refine_width, self.final_refine_threshold):
+            widget.valueChanged.connect(lambda *_: self._arc_parameters_changed(3))
+
+    def _arc_parameters_changed(self, stage):
+        if self._arc_stage >= stage:
+            self._arc_stage = stage
+            self._invalidate_arc(stage)
+            self._arc_preview_timer.start(350)
+
+    def _invalidate_arc(self, stage):
+        self.W_sci_groups, self.W_std_groups = {}, {}
+        self.final_groups = {}
+        self.flux_calibrated = self.final_spec = None
+        self.flux_cal_btn.setEnabled(False)
+        for n, attr in enumerate(('wave2', 'wave3', 'final_wave'), 1):
+            if n >= stage and hasattr(self, attr):
+                delattr(self, attr)
+        if stage <= 1:
+            self.confirm_identify_btn.setEnabled(False)
+            self.refine1_btn.setEnabled(False)
+        if stage <= 2:
+            self.refine2_btn.setEnabled(False)
+        self.confirm_final_btn.setEnabled(False)
+
+    def _refresh_arc_preview(self):
+        if self._arc_stage and self.tabs.tabText(self.tabs.currentIndex()) == 'Spectral Calibration':
+            (self.identify_lines, self.first_refinement, self.final_refinement)[self._arc_stage-1]()
 
 
     def handle_arc_selection(self):
@@ -1389,6 +2223,7 @@ class SpectroscopicReductionGUI(QMainWindow):
             if os.path.exists(default_path):
                 print(f"Using arc file: {default_path}")
                 self.browse_button.hide()
+                self._actual_arc_path = str(default_path)
                 self.arc_file.setText(str(default_path))
                 return default_path  # Success case
                 
@@ -1425,17 +2260,18 @@ class SpectroscopicReductionGUI(QMainWindow):
             self.browse_button.hide()
             
     def get_arc_path(self):
-        """Returns full path or raises exceptions"""
-        filename = self.arc_file.text().strip()
-        if not filename:
-            raise ValueError("Please enter an arc filename!")
-        print(f" the filenam provided {filename}")
-        full_path = os.path.join(str(self.resource_path), "arc", filename)
-        if not os.path.exists(full_path):
-            raise FileNotFoundError()
-        
-        return full_path
-
+        """Resolve the selected arc reference correctly on Linux or Windows."""
+        name = self.arc_file.text().strip()
+        if not name:
+            raise ValueError('Please enter an arc reference filename.')
+        candidates = [name]
+        if getattr(self, '_actual_arc_path', None) and os.path.basename(self._actual_arc_path) == os.path.basename(name):
+            candidates.insert(0, self._actual_arc_path)
+        candidates.append(os.path.join(self.resource_path.text().strip(), 'arc', os.path.basename(name)))
+        for path in candidates:
+            if os.path.isfile(path):
+                return os.path.abspath(path)
+        raise FileNotFoundError('Arc reference not found: ' + ', '.join(candidates))
 
     def estimate_wavelength_solution(self):
         """Interactive estimation of offset/dispersion"""
@@ -1445,7 +2281,7 @@ class SpectroscopicReductionGUI(QMainWindow):
                 raise ValueError("No arc data loaded")
             
             # Validate arc filename
-            arcfile = self.arc_file.text().strip()
+            arcfile = self.get_arc_path().strip()
             if not arcfile:
                 QMessageBox.warning(self, "Input Needed", "Please enter an arc filename first")
                 return
@@ -1501,34 +2337,42 @@ class SpectroscopicReductionGUI(QMainWindow):
     def confirm_initial_solution(self):
         """Confirm initial wavelength solution"""
         self.identify_btn.setEnabled(True)
+        self._arc_preview_timer.stop()
+        self._arc_stage = 0
+        self._invalidate_arc(1)
         self.log_message(f"Initial solution confirmed: offset={self.offset:.2f}, disp={self.dispersion:.2f}")
 
     def identify_lines(self):
         """First line identification"""
         try:
+            self._arc_preview_timer.stop()
+            self._arc_stage = 1
+            self._invalidate_arc(1)
             sciarc_ex = self.ARCdata[0]
-            arcfile = self.arc_file.text()
+            arcfile = self.get_arc_path()
             
             # Calculate initial wavelengths
             sci_xp = sciarc_ex.spectral_axis.value
             self.wave1 = add.XFIT(sci_xp, self.offset, self.dispersion)
             print(f"func for line identification {self.line_func.currentText()}")
             # First identification
-            self.wave2 = identify.fit_arclines(
+            self.wave2, details = identify.fit_arclines(
                 self.wave1,
                 sciarc_ex.flux.value,
                 arcfile,
                 autotol=self.search_width.value(),
                 pthreshold=self.threshold.value(),
-                func=self.line_func.currentText(),deg=self.deg_val.value()
+                func=self.line_func.currentText(),deg=self.deg_val.value(), display=False, return_details=True
             )
             
+            self._arc_views(self.wave2, sciarc_ex.flux.value, details, 'Arc line identification')
             self.confirm_identify_btn.setEnabled(True)
             self.refine1_btn.setEnabled(True)
             self.log_message("Line identification completed")
             
         except Exception as e:
             self.log_message(f"Error in line identification: {str(e)}")
+            self.viewer_title.setText(f'Line identification failed: {e}')
 
     def confirm_line_identification(self):
         """Confirm identified lines"""
@@ -1538,50 +2382,66 @@ class SpectroscopicReductionGUI(QMainWindow):
     def first_refinement(self):
         """First refinement step"""
         try:
+            self._arc_preview_timer.stop()
+            self._arc_stage = 2
+            self._invalidate_arc(2)
             sciarc_ex = self.ARCdata[0]
-            arcfile = self.arc_file.text()
+            arcfile = self.get_arc_path()
             
-            self.wave3 = identify.fit_arclines(
+            self.wave3, details = identify.fit_arclines(
                 self.wave2,
                 sciarc_ex.flux.value,
                 arcfile,
                 self.refine_width.value(),
-                self.refine_threshold.value(),func=self.line_func.currentText(),deg=self.deg_val.value()
+                self.refine_threshold.value(),func=self.line_func.currentText(),deg=self.deg_val.value(), display=False, return_details=True
             )
             
+            self._arc_views(self.wave3, sciarc_ex.flux.value, details, 'First wavelength refinement')
             self.refine2_btn.setEnabled(True)
             self.log_message("First refinement completed")
             
         except Exception as e:
             self.log_message(f"Error in first refinement: {str(e)}")
+            self.viewer_title.setText(f'First refinement failed: {e}')
 
     def final_refinement(self):
         """Final refinement step"""
         try:
+            self._arc_preview_timer.stop()
+            self._arc_stage = 3
+            self._invalidate_arc(3)
             sciarc_ex = self.ARCdata[0]
-            arcfile = self.arc_file.text()
+            arcfile = self.get_arc_path()
             
-            self.final_wave = identify.fit_arclines(
+            self.final_wave, details = identify.fit_arclines(
                 self.wave3,
                 sciarc_ex.flux.value,
                 arcfile,
                 self.final_refine_width.value(),
-                self.final_refine_threshold.value(),func=self.line_func.currentText(),deg=self.deg_val.value(),saveplot=True,
-                plotoutdir=os.getcwd()
+                self.final_refine_threshold.value(),func=self.line_func.currentText(),deg=self.deg_val.value(), display=False, return_details=True
             )
             
+            self._arc_views(self.final_wave, sciarc_ex.flux.value, details, 'Final wavelength solution')
+            self.final_wave_details = details
             self.confirm_final_btn.setEnabled(True)
             self.log_message("Final refinement completed")
             
         except Exception as e:
             self.log_message(f"Error in final refinement: {str(e)}")
+            self.viewer_title.setText(f'Final refinement failed: {e}')
 
     def confirm_final_solution(self):
         """Confirm final wavelength solution"""
+        if not hasattr(self, 'final_wave'):
+            return
+        try:
+            identify._plot_calibration(self.final_wave, self.ARCdata[0].flux.value, self.final_wave_details, display=False, filename=os.path.join(os.getcwd(), 'final_wavecalib.png'))
+        except Exception as exc:
+            self.log_message(f'Could not save wavelength diagnostic: {exc}')
         self.log_message("Final wavelength solution confirmed")
 
     def perform_spectral_calibration(self):
-        """Perform spectral calibration for all groups and save to FITS"""
+        """Keep wavelength-calibrated groups in memory until final export."""
         try:
             if not hasattr(self, 'final_wave'):
                 raise ValueError("Please complete all refinement steps")
@@ -1589,28 +2449,21 @@ class SpectroscopicReductionGUI(QMainWindow):
             # Initialize storage for calibrated spectra
             self.W_sci_groups = {}
             self.W_std_groups = {}
+            self.final_groups = {}
+            self.flux_calibrated = self.final_spec = None
+            self.flux_cal_btn.setEnabled(False)
             
             # Process all science groups
             for group_id, sci_spec in self.combined_spectra['SCI'].items():
-                calibrated = Spectrum1D(
-                    spectral_axis=self.final_wave * u.AA,
-                    flux=sci_spec.flux,
-                    uncertainty=sci_spec.uncertainty
-                )
+                calibrated = self._calibrate_single_spectrum(sci_spec)
                 self.W_sci_groups[group_id] = calibrated
-                self._save_calibrated_spectrum(calibrated, 'science', group_id)
             
             # Process all standard groups
             for group_id, std_spec in self.combined_spectra['STD'].items():
-                calibrated = Spectrum1D(
-                    spectral_axis=self.final_wave * u.AA,
-                    flux=std_spec.flux,
-                    uncertainty=std_spec.uncertainty
-                )
+                calibrated = self._calibrate_single_spectrum(std_spec)
                 self.W_std_groups[group_id] = calibrated
-                self._save_calibrated_spectrum(calibrated, 'standard', group_id)
             
-            self.log_message("Spectral calibration completed and saved for all groups")
+            self.log_message("Spectral calibration completed for all groups (in memory)")
             
         except Exception as e:
             error_msg = f"Error in spectral calibration: {str(e)}"
@@ -1619,10 +2472,13 @@ class SpectroscopicReductionGUI(QMainWindow):
 
     def _calibrate_single_spectrum(self, spectrum):
         """Apply wavelength calibration to a single spectrum"""
+        meta = dict(spectrum.meta)
+        meta.update(wcal_rms=self.final_wave_details['rms'], wcal_degree=self.final_wave_details['degree'], wcal_nlines=len(self.final_wave_details['pixels']))
         return Spectrum1D(
             spectral_axis=self.final_wave * u.AA,
             flux=spectrum.flux,
-            uncertainty=spectrum.uncertainty
+            uncertainty=spectrum.uncertainty,
+            meta=meta
         )
 
     def _save_calibrated_spectrum00(self, spectrum, spec_type, group_id):
@@ -1724,7 +2580,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # ===== 1. Extinction File Selection =====
         ext_layout = QHBoxLayout()
-        ext_layout.addWidget(QLabel("Extinction File:"))
+        ext_layout.addWidget(self.create_info_label('extinction', 'Extinction File:'))
         
         # Set default path to extinction file in resources
         default_ext = os.path.join(script_dir,"resources", "extinction", "DOT_extinction.dat")
@@ -1738,7 +2594,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # ===== 2. Standard Star Selection =====
         std_layout = QHBoxLayout()
-        std_layout.addWidget(QLabel("Standard Star:"))
+        std_layout.addWidget(self.create_info_label('standard_star', 'Standard Star:'))
         
         # Standard star name (default from self.stdname)
         #self.std_name_edit = QLineEdit(getattr(self, 'stdname', ""))
@@ -1765,7 +2621,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         # Preview figure
         self.sens_figure = Figure()
         self.sens_canvas = FigureCanvas(self.sens_figure)
-        preview_layout.addWidget(self.sens_canvas)
+        # Sensitivity preview is displayed in the persistent upper-right viewer.
         
         # Preview button
         self.preview_btn = QPushButton("Preview Sensitivity Curve")
@@ -1781,7 +2637,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         
         # Sensitivity function mode
         mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("Sensitivity Mode:"))
+        mode_layout.addWidget(self.create_info_label('sensitivity_mode', 'Sensitivity Mode:'))
         self.sens_mode = QComboBox()
         self.sens_mode.addItems(["linear", "spline"])
         mode_layout.addWidget(self.sens_mode)
@@ -1795,9 +2651,9 @@ class SpectroscopicReductionGUI(QMainWindow):
         display_layout.addWidget(self.display_sens_check)
         
         display_layout.addWidget(QLabel("Display Final Spectrum:"))
-        self.display_final_check = QCheckBox()
-        self.display_final_check.setChecked(True)
-        display_layout.addWidget(self.display_final_check)
+        self.display_flux_final_check = QCheckBox()
+        self.display_flux_final_check.setChecked(True)
+        display_layout.addWidget(self.display_flux_final_check)
         param_layout.addLayout(display_layout)
         
         flux_layout.addWidget(param_group)
@@ -1838,7 +2694,7 @@ class SpectroscopicReductionGUI(QMainWindow):
         out_layout.addLayout(redshift_layout)
         '''
         redshift_layout = QHBoxLayout()
-        redshift_layout.addWidget(QLabel("Redshift:"))
+        redshift_layout.addWidget(self.create_info_label('redshift', 'Redshift:'))
         self.redshift = QDoubleSpinBox()
         self.redshift.setDecimals(3)
         self.redshift.setRange(0.000, 2)
@@ -1854,24 +2710,48 @@ class SpectroscopicReductionGUI(QMainWindow):
         self.display_final_check.setChecked(True)
         display_layout.addWidget(self.display_final_check)
         out_layout.addLayout(display_layout)
+        cut_layout = QHBoxLayout()
+        self.output_cut = QCheckBox('Wavelength cutoff (observed Å)')
+        cut_layout.addWidget(self.create_info_label('wavelength_cutoff', self.output_cut, checkbox=True))
+        self.output_low, self.output_high = QDoubleSpinBox(), QDoubleSpinBox()
+        for widget, value in ((self.output_low, 4500), (self.output_high, 9000)):
+            widget.setRange(0, 1000000)
+            widget.setDecimals(1)
+            widget.setValue(value)
+            cut_layout.addWidget(widget)
+        out_layout.addLayout(cut_layout)
+        bin_layout = QHBoxLayout()
+        bin_layout.addWidget(self.create_info_label('output_bin', 'Bin size (pixels; 1 = off):'))
+        self.output_bin = QSpinBox()
+        self.output_bin.setRange(1, 10000)
+        self.output_bin.setValue(5)
+        bin_layout.addWidget(self.output_bin)
+        out_layout.addLayout(bin_layout)
+        preview_btn = QPushButton('Display Spectrum')
+        preview_btn.clicked.connect(self.plot_final_spectrum)
+        out_layout.addWidget(preview_btn)
+        for widget in (self.redshift, self.output_low, self.output_high, self.output_bin):
+            widget.valueChanged.connect(self._refresh_output_preview)
+        for widget in (self.output_cut, self.display_final_check):
+            widget.toggled.connect(self._refresh_output_preview)
         
         # Save final spectrum button
-        save_button = QPushButton("Save Final Spectrum")
+        save_button = QPushButton("Save Final FITS Tables (All Groups)")
         save_button.clicked.connect(self.save_final_spectrum)
         out_layout.addWidget(save_button)
 
         # Save final spectrum plot button
-        save_button = QPushButton("Save Final Spectrum PLot")
+        save_button = QPushButton("Save Final Spectrum Plots (All Groups)")
         save_button.clicked.connect(self.save_final_plot)
         #save_button.clicked.connect(self.plot_final_spectrum)
         out_layout.addWidget(save_button)        
         # Plot area
         self.figure = Figure()
         self.canvas = FigureCanvas(self.figure)
-        out_layout.addWidget(self.canvas)
+        # Final-spectrum preview uses the persistent upper-right viewer.
         
         layout.addWidget(out_group)
-        tab.setLayout(layout)
+        # The QWidget already owns its layout.
         self.tabs.addTab(tab, "Output")
 
     def select_extinction_file(self):
@@ -1933,17 +2813,13 @@ class SpectroscopicReductionGUI(QMainWindow):
                 raise ValueError("No wavelength-calibrated standard spectrum available")
 
             # Read standard star reference data
-            star = fluxcal.stdstr(std_file)
+            star = fluxcal.stdstr(std_file, display=False)
             
             # Get extinction data
             Xfile = fluxcal.read_obs_extinction(self.ext_file.text())
             
             # Apply airmass correction
-            if not self.std_lst:
-                raise ValueError("No standard star observation files available")
-            
-            std_ccd = ccdproc.CCDData.read(self.std_lst[-1], unit="adu")
-            cal_am = airmass.Airmass(std_ccd, self.std_name.text())
+            cal_am = std_spec.meta['airmass']
             CAL = fluxcal.airmass_cor(std_spec, cal_am, Xfile)
 
             # Create preview sensitivity function
@@ -1954,25 +2830,8 @@ class SpectroscopicReductionGUI(QMainWindow):
                 display=False  # We'll display our own preview
             )
 
-            # Plot sensitivity curve
-            self.sens_figure.clear()
-            ax = self.sens_figure.add_subplot(111)
-            
-            ax.plot(sens_func.spectral_axis, sens_func.flux)
-            ax.set_xlabel('Wavelength (Å)')
-            ax.set_ylabel('Sensitivity')
-            ax.set_title('Sensitivity Function Preview')
-            
-            # Add wavelength markers for important features
-            try:
-                peaks, _ = find_peaks(sens_func.flux.value, height=np.nanmedian(sens_func.flux.value)*1.5)
-                for peak in peaks:
-                    ax.axvline(x=sens_func.spectral_axis[peak].value, 
-                              color='r', linestyle=':', alpha=0.3)
-            except Exception:
-                pass  # Skip if peak finding fails
-                
-            self.sens_canvas.draw()
+            # Show sensitivity directly in the persistent viewer.
+            self._sensitivity_views(CAL, sens_func, star)
             self.flux_cal_btn.setEnabled(True)
             self.log_message("Sensitivity curve preview generated")
 
@@ -1981,76 +2840,146 @@ class SpectroscopicReductionGUI(QMainWindow):
             QMessageBox.warning(self, "Preview Failed", str(e))
 
     def perform_flux_calibration(self):
-        """Perform flux calibration using the saved wavelength-calibrated files"""
+        """Calibrate each science group in memory; export only in Output."""
         try:
-            # Process each science group
-            for group_id in self.W_sci_groups:
-                sci_file = f"{self.sciname}_group{group_id}_wcal.fits"
-                std_file = f"{self.stdname}_group{group_id}_wcal.fits"
-                
-                if not os.path.exists(sci_file) or not os.path.exists(std_file):
-                    self.log_message(f"Skipping group {group_id} - missing files")
-                    continue
-                    
-                # Load the spectra
-                sci_spec = fluxcal.load_calibrated_spectrum(sci_file)
-                std_spec = fluxcal.load_calibrated_spectrum(std_file)
-                
-                # Perform flux calibration
-                self.flux_calibrated = self._calibrate_flux(sci_spec, std_spec)
-                
-                # Save result
-                output_name = f"{self.sciname}_group{group_id}_fluxcal.fits"
-                self._save_flux_calibrated(self.flux_calibrated, output_name)
-                
-            self.log_message("Flux calibration completed for all groups")
+            self.final_groups = {}
+            self.flux_calibrated = self.final_spec = None
+            if not self.W_sci_groups or not self.W_std_groups:
+                raise ValueError('Complete wavelength calibration for science and standard groups first.')
+            mapping = {}
+            for gid in self.W_sci_groups:
+                if gid in self.W_std_groups:
+                    mapping[gid] = gid
+                elif len(self.W_std_groups) == 1:
+                    mapping[gid] = next(iter(self.W_std_groups))
+                else:
+                    raise ValueError(f'No matching standard for science group {gid}; assign matching Combine IDs.')
+            results, records = {}, []
+            for gid, std_gid in mapping.items():
+                sci_spec, std_spec = self.W_sci_groups[gid], self.W_std_groups[std_gid]
+                spec, sensitivity, diagnostics = self._calibrate_flux(sci_spec, std_spec)
+                results[gid] = dict(spectrum=spec, sensitivity=sensitivity, meta=dict(sci_spec.meta), std_meta=dict(std_spec.meta), std_group=std_gid, standard=self.std_file_display.text(), mode=self.sens_mode.currentText(), extinction=self.ext_file.text())
+                self.log_message(f'Calibrated science group {gid} using standard group {std_gid}')
+                if self.display_sens_check.isChecked():
+                    records.extend(dict(record, title=f'Group {gid} | '+record['title']) for record in diagnostics)
+                if self.display_flux_final_check.isChecked():
+                    records.append(dict(title=f'Flux-calibrated science | group {gid}', xlabel='Wavelength (Å)', ylabel=f'Flux ({spec.flux.unit})', series=[(spec.spectral_axis.value, spec.flux.value, f'Group {gid}', '#50c7dd', False)]))
+            self.final_groups = results
+            self.flux_calibrated = self.final_spec = next(iter(results.values()))['spectrum']
+            if records:
+                self._diagnostic_views(records)
+            self.log_message('Flux calibration completed for all groups. Save final FITS tables from Output.')
             
         except Exception as e:
             error_msg = f"Error in flux calibration: {str(e)}"
             self.log_message(error_msg)
             QMessageBox.critical(self, "Error", error_msg)
-
     def _calibrate_flux(self, sci_spec, std_spec):
-        """
-        Thin GUI wrapper: pull parameters from the widgets, delegate the
-        actual calibration to specred.calib.flux.calibrate_flux (moved
-        there so it's usable/testable without the GUI), and translate
-        errors into log messages.
-        """
+        """Perform flux calibration for a single science-standard pair"""
         try:
-            sci_am = airmass.Airmass(self.sci_lst[-1], self.sciname) if self.sci_lst else 1.0
-            std_am = airmass.Airmass(self.std_lst[-1], self.stdname) if self.std_lst else 1.0
-
-            return fluxcal.calibrate_flux(
-                sci_spec, std_spec,
-                extinction_file=self.ext_file.text(),
-                sci_airmass=sci_am,
-                std_airmass=std_am,
-                std_file=self.std_file_display.text(),
-                sens_mode=self.sens_mode.currentText(),
-                display=self.display_sens_check.isChecked(),
+            # Get extinction data
+            extinction_file = self.ext_file.text()
+            if not os.path.exists(extinction_file):
+                raise FileNotFoundError(f"Extinction file not found: {extinction_file}")
+            
+            Xfile = fluxcal.read_obs_extinction(extinction_file)
+            
+            # Apply airmass correction
+            sci_am = sci_spec.meta['airmass']
+            std_am = std_spec.meta['airmass']
+            
+            CAL = fluxcal.airmass_cor(std_spec, std_am, Xfile)
+            SCI = fluxcal.airmass_cor(sci_spec, sci_am, Xfile)
+            
+            # Get standard star data
+            std_file = self.std_file_display.text()
+            if not std_file:
+                raise ValueError("No standard star file selected")
+            
+            star = fluxcal.stdstr(std_file, display=False)
+            
+            # Create sensitivity function
+            sens_func = fluxcal.standard_sensfunc(
+                CAL,
+                star,
+                mode=self.sens_mode.currentText(),
+                display=False
             )
+            
+            # Apply sensitivity function
+            flux_calibrated = fluxcal.apply_sensfunc(SCI, sens_func)
+            return flux_calibrated, sens_func, self._sensitivity_views(CAL, sens_func, star, show=False)
+        
         except Exception as e:
             self.log_message(f"Error in flux calibration: {str(e)}")
             raise
+    
+    def _sensitivity_views(self, observed, sensitivity, star, show=True):
+        wave = observed.spectral_axis.value
+        raw = observed.flux.value
+        calibrated = fluxcal.apply_sensfunc(observed, sensitivity).flux.value
+        def normalize(values):
+            scale = np.nanmedian(np.abs(values[np.isfinite(values)]))
+            return values / scale if np.isfinite(scale) and scale > 0 else values * np.nan
+        records = [
+            dict(title='Observed × sensitivity — standard star comparison', xlabel='Wavelength (Å)', ylabel='Flux (independently normalized)', series=[(wave, normalize(raw), 'Observed', '#50c7dd', False), (wave, normalize(calibrated), 'Observed × sensitivity', '#f8ad62', False)]),
+            dict(title='Calibrated standard vs reference', xlabel='Wavelength (Å)', ylabel=f'Flux ({star["flux"].unit})', series=[(wave, calibrated, 'Observed × sensitivity', '#50c7dd', False), (np.asarray(star['wave']), np.asarray(star['flux']), 'Reference standard', '#f8ad62', True)]),
+            dict(title='Sensitivity function', xlabel='Wavelength (Å)', ylabel=f'Sensitivity ({sensitivity.flux.unit})', series=[(sensitivity.spectral_axis.value, sensitivity.flux.value, 'Sensitivity', '#50c7dd', False)])]
+        if show:
+            self._diagnostic_views(records)
+        return records
+
+    def _load_calibrated_spectrum(self, filename):
+        """Load a wavelength-calibrated spectrum from FITS"""
+        with fits.open(filename) as hdul:
+            flux = hdul[0].data
+            wave = hdul['WAVELENGTH'].data
+            uncertainty = hdul['UNCERTAINTY'].data if 'UNCERTAINTY' in hdul else None
+            
+        return Spectrum1D(
+            flux=flux * u.Unit('count'),
+            spectral_axis=wave * u.AA,
+            uncertainty=StdDevUncertainty(uncertainty) if uncertainty is not None else None
+        )
 
     def _save_flux_calibrated(self, spectrum, filename):
-        """Thin GUI wrapper around specred.calib.flux.save_flux_calibrated."""
+        """Save flux-calibrated spectrum to FITS file"""
         try:
-            fluxcal.save_flux_calibrated(
-                spectrum, filename,
-                calsrc=self.std_file_display.text(),
-                calmode=self.sens_mode.currentText(),
-            )
+            # Create primary HDU with flux
+            primary_hdu = fits.PrimaryHDU(spectrum.flux.value)
+            primary_hdu.header['BUNIT'] = 'erg/s/cm^2/Angstrom'
+            
+            # Create HDU list
+            hdus = [primary_hdu]
+            
+            # Add uncertainty if available
+            if spectrum.uncertainty is not None:
+                uncert_hdu = fits.ImageHDU(spectrum.uncertainty.array, name='UNCERTAINTY')
+                hdus.append(uncert_hdu)
+            
+            # Add wavelength array
+            wave_hdu = fits.ImageHDU(spectrum.spectral_axis.value, name='WAVELENGTH')
+            wave_hdu.header['BUNIT'] = 'Angstrom'
+            hdus.append(wave_hdu)
+            
+            # Add calibration metadata
+            primary_hdu.header['CALSRC'] = self.std_file_display.text()
+            primary_hdu.header['CALMODE'] = self.sens_mode.currentText()
+            primary_hdu.header['CRVAL1'] = spectrum.spectral_axis[0].value
+            primary_hdu.header['CDELT1'] = np.mean(np.diff(spectrum.spectral_axis.value))
+            
+            # Write to file
+            hdulist = fits.HDUList(hdus)
+            hdulist.writeto(filename, overwrite=True)
             self.log_message(f"Saved flux-calibrated spectrum: {filename}")
+            
         except Exception as e:
             self.log_message(f"Error saving flux-calibrated spectrum: {str(e)}")
             raise
-
     def save_final_plot(self):
         """ save plot of the final spectrum"""
         try:
-            if not hasattr(self,'final_spec'):
+            if not self.final_groups:
                 raise ValueError("no final spectrum available")
 
             output_name = self.output_name.text()
@@ -2059,7 +2988,8 @@ class SpectroscopicReductionGUI(QMainWindow):
             if not output_name:
                 output_name = self.sciname
             #plot_final_spectrum()
-            final.save_plot(self.flux_calibrated,name=output_name,redshift=Redshift)
+            for gid, result in self.final_groups.items():
+                final.save_plot(result['spectrum'], name=f'{output_name}_group{gid}', wbin=self.output_cut.isChecked(), lw=self.output_low.value(), uw=self.output_high.value(), redshift=Redshift, binsize=self.output_bin.value(), display=False)
 
             self.log_message(f" save the plot of final spectrum")
 
@@ -2071,70 +3001,117 @@ class SpectroscopicReductionGUI(QMainWindow):
     
 
     def save_final_spectrum(self):
-        """Save the final calibrated spectrum"""
+        """Export one primary-header + binary-table FITS file per science group."""
         try:
-            if not hasattr(self, 'final_spec'):
+            if not self.final_groups:
                 raise ValueError("No final spectrum to save")
             
             output_name = self.output_name.text()
             if not output_name:
                 output_name = self.sciname
             
-            # Save the spectrum
-            print(f" the final spec for save_spectrum {self.final_spec}")
-            print(f" the final spec  {self.flux_calibrated}")
-
-            final.save_spectrum(self.flux_calibrated, output_name+"_MJD"+str(int(self.sci_mjd)))
-            
-            self.log_message(f"Final spectrum saved as {output_name}.csv")
-            QMessageBox.information(self, "Success", f"Spectrum saved as {output_name}.csv")
+            files = []
+            for gid, result in self.final_groups.items():
+                filename = f'{output_name}_group{gid}_final.fits'
+                self._write_final_group(filename, gid, result)
+                files.append(filename)
+                self.log_message(f'Saved final spectrum: {filename}')
+            QMessageBox.information(self, 'Success', '\n'.join(files))
             
         except Exception as e:
             error_msg = f"Error saving spectrum: {str(e)}"
             self.log_message(error_msg)
             QMessageBox.critical(self, "Error", f"Failed to save spectrum: {str(e)}")
 
+    def _write_final_group(self, filename, gid, result):
+        spec, sens, meta = result['spectrum'], result['sensitivity'], result['meta']
+        wave = spec.spectral_axis.to_value(u.AA)
+        flux = spec.flux.value
+        if spec.uncertainty is None:
+            raise ValueError(f'Group {gid} has no propagated flux uncertainty.')
+        err = spec.uncertainty.represent_as(StdDevUncertainty).quantity.to_value(spec.flux.unit)
+        sw = sens.spectral_axis.to_value(u.AA)
+        order = np.argsort(sw)
+        response = np.interp(wave, sw[order], sens.flux.value[order])
+        headers = meta.get('headers', [])
+        header = fits.Header(headers[0]) if headers else fits.Header()
+        # The primary HDU is metadata only; raw image WCS must not describe the table.
+        for key in list(header):
+            if key in ('BUNIT', 'CHECKSUM', 'DATASUM', 'BSCALE', 'BZERO', 'BLANK', 'WCSAXES') or key.startswith(('CRPIX', 'CRVAL', 'CDELT', 'CTYPE', 'CUNIT', 'CROTA', 'CD1_', 'CD2_', 'PC1_', 'PC2_')):
+                del header[key]
+        primary = fits.PrimaryHDU(header=header)
+        h = primary.header
+        h['COMBGRP'] = (str(gid), 'Science combination group ID')
+        h['STDGROUP'] = (str(result['std_group']), 'Standard combination group ID')
+        h['COMBMETH'] = meta['combine_method']
+        h['NCOMBINE'] = len(meta['input_files'])
+        h['AIRMASS'] = (meta['airmass'], 'Mean science group airmass')
+        h['STDAM'] = (result['std_meta']['airmass'], 'Mean standard group airmass')
+        h['CALSRC'] = os.path.basename(result['standard'])
+        h['CALMODE'] = result['mode']
+        h['EXTFILE'] = os.path.basename(result['extinction'])
+        h['WCALTYPE'] = 'Final'
+        h['WCALFUNC'] = 'Chebyshev'
+        h['WCALDEG'] = meta['wcal_degree']
+        h['WCALRMS'] = (meta['wcal_rms'], 'Wavelength-fit RMS in Angstrom')
+        h['WCALNPTS'] = meta['wcal_nlines']
+        h['REDSHIFT'] = (self.redshift.value(), 'Preview redshift; stored wavelength observed')
+        for i, path in enumerate(meta['input_files'], 1):
+            h[f'INFIL{i:03d}'] = os.path.basename(path)
+        for i, path in enumerate(result['std_meta']['input_files'], 1):
+            h[f'STFIL{i:03d}'] = os.path.basename(path)
+        h.add_history('Flux calibrated using group mean airmass and interpolated standard sensitivity.')
+        h.add_history('Table contains native observed wavelengths and unbinned flux; preview settings do not modify data.')
+        columns = [fits.Column(name='WAVELENGTH', format='D', unit='Angstrom', array=wave),
+                   fits.Column(name='FLUX', format='D', unit=spec.flux.unit.to_string('fits'), array=flux),
+                   fits.Column(name='FLUX_ERROR', format='D', unit=spec.flux.unit.to_string('fits'), array=err),
+                   fits.Column(name='SENSITIVITY', format='D', unit=sens.flux.unit.to_string('fits'), array=response)]
+        table = fits.BinTableHDU.from_columns(columns, name='SPECTRUM')
+        fits.HDUList([primary, table]).writeto(filename, overwrite=True, checksum=True)
+
+
+    def _refresh_output_preview(self, *_):
+        if self.tabs.tabText(self.tabs.currentIndex()) == 'Output':
+            self.plot_final_spectrum()
 
     def plot_final_spectrum(self):
-        """Plot the final calibrated spectrum"""
-        # NOTE (bug fixes applied here):
-        #   - guarded on 'final_spec' but used self.flux_calibrated -> guard
-        #     now checks the attribute actually used.
-        #   - `plt` was never imported (only matplotlib.pylab as pllt) -> the
-        #     stray plt.show() call is removed; this widget draws into the
-        #     embedded self.sens_canvas, it doesn't need a separate window.
-        #   - `box_kernal` typo (undefined name) -> box_kernel.
-        #   - convolve() on the uncertainty array was missing the kernel arg.
-        #   - self.redshift is the QDoubleSpinBox widget, not a number ->
-        #     use self.redshift.value().
-        if hasattr(self, 'flux_calibrated'):
-            redshift = self.redshift.value()
-            self.sens_figure.clear()
-            ax = self.sens_figure.add_subplot(111)
-
-            ax.errorbar(self.flux_calibrated.spectral_axis.value/(1+redshift), self.flux_calibrated.flux.value,self.flux_calibrated.uncertainty.array,ecolor="g")
-            ## smoothed curve
-            box_kernel = Box1DKernel(5)
-            newflx = convolve(self.flux_calibrated.flux.value,box_kernel)
-            newflxerr = convolve(self.flux_calibrated.uncertainty.array,box_kernel)
-            ax.errorbar(self.flux_calibrated.spectral_axis.value/(1+redshift),newflx,newflxerr,ecolor="gray")
-            ax.axvline(6563,color="brown",alpha=0.7,ls="dashed",label="H alpha")
-            ax.axvline(5007,color="brown",alpha=0.7,ls="dashed",label="OIII")
-            ax.axvline(4861,color="brown",alpha=0.7,ls="dashed",label="H beta")
-            ax.set_xlabel('Wavelength (Å)')
-            ax.set_ylabel('Flux')
-            ax.set_title('Final Calibrated Spectrum')
-            self.sens_canvas.draw()
+        """Show the final calibrated spectrum in the upper-right viewer."""
+        if self.final_groups:
+            if not self.display_final_check.isChecked():
+                self.viewer_plot.clear()
+                self._aperture_views = []
+                self._aperture_view_index = -1
+                self._update_view_navigation()
+                self.viewer_title.setText('Final spectrum hidden')
+                return
+            previous = self._aperture_views[self._aperture_view_index].get('group_id') if 0 <= self._aperture_view_index < len(self._aperture_views) else None
+            records = []
+            try:
+                for gid, result in self.final_groups.items():
+                    spec = result['spectrum']
+                    wave, flux, bw, bf = final.preview_arrays(spec, self.output_cut.isChecked(), self.output_low.value(), self.output_high.value(), self.redshift.value(), self.output_bin.value())
+                    series = [(wave, flux, 'Observed spectrum', '#50c7dd', False)]
+                    if self.output_bin.value() > 1:
+                        series.append((bw, bf, f'Binned ({self.output_bin.value()} px)', '#f8ad62', False))
+                    lines = [(w, label, '#80c980') for w, label in ((4861, 'Hβ'), (5007, '[O III]'), (6563, 'Hα')) if np.nanmin(wave) <= w <= np.nanmax(wave)] if self.redshift.value() else []
+                    records.append(dict(group_id=gid, title=f'Final spectrum | Group {gid} — z = {self.redshift.value():.3f}', xlabel='Rest wavelength (Å)' if self.redshift.value() else 'Observed wavelength (Å)', ylabel=f'Flux ({spec.flux.unit})', series=series, lines=lines))
+                self._diagnostic_views(records)
+                if previous in self.final_groups:
+                    self._show_aperture_record(list(self.final_groups).index(previous))
+            except ValueError as e:
+                self.viewer_title.setText(str(e))
+        else:
+            self.viewer_plot.clear()
+            self._aperture_views = []
+            self._aperture_view_index = -1
+            self._update_view_navigation()
+            self.viewer_title.setText('No final calibrated groups available')
 
 #******************************************************************************************************#
 
-def main():
-    """Entry point for the `specred-gui` console script."""
+if __name__ == "__main__":
+    #resource_path = "disk1/ADFOSC_pp/T_script/resources"
     app = QApplication(sys.argv)
     gui = SpectroscopicReductionGUI()
     gui.show()
     sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    main()
