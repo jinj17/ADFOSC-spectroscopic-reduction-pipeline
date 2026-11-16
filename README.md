@@ -47,19 +47,17 @@ A reduction run is described by a YAML config (see
 ```yaml
 workdir: "./data/"
 bias_pattern: "bias*fit"
-continuum_lamp: "Lamp3*arc*fit"
+continuum_lamp: "continuum*fit"
 arc_lamp:
-  pattern: "lamp*fit"
+  pattern: "arclamp*fit"
   name: "HgAr_neon.dat"
 standard_star:
   pattern: "Feige66*fit"
   name: "Feige66"
-  dispersion: "485"
   combine: "mean"
 science_obj:
-  pattern: "1101+1102*fit"
-  name: "1101+1102"
-  dispersion: "465"
+  pattern: "science*fit"
+  name: "simbad name"
   xlim: "1500"
   combine: "mean"
 slit: '1.5"'
@@ -114,24 +112,14 @@ specred_pipeline/
 │   └── resources/                arc line lists & standard star tables (add your own)
 ├── gui/                     # PyQt front-end (thin; calls into src/specred)
 │   ├── main_window.py
-│   └── dialogs/
-│       └── wavelength_dialog.py
+│          
 ├── examples/
 │   └── fileinfo_example.yaml
 └── tests/                   # add unit tests for the library modules here
 ```
 
-## Known gaps to address before/after publishing
+### Update V1.1
+1. Dispersion line trace approach is changed.
+2. Upgrade in the GUI interface
+3. Changes in the final file saving format.
 
-- No automated tests yet (`tests/` is a stub) — at minimum, worth
-  covering `specred.io.readfile` (with tiny synthetic FITS files) and
-  the flux-calibration functions in `specred.calib.flux`, since those
-  are the ones most likely to silently regress.
-- `src/specred/utils.py` still has a fair amount of exploratory/dead
-  code (commented-out alternate implementations of the same
-  functions). Worth a pass to trim once you're confident which
-  versions are canonical.
-- The GUI's sensitivity-preview and final-spectrum-preview plotting
-  methods had a few silent bugs (undefined names caught by bare
-  `except Exception`) fixed during this refactor — worth a manual
-  click-through test of those two plots specifically.
