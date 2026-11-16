@@ -1,25 +1,23 @@
 # input pars
 
-workdir: "/opt/test_spec_code/"
+workdir: "path_to_data_directory"
 
 bias_pattern: "bias*fit"
 
-continuum_lamp: "Lamp3*arc*fit"
+continuum_lamp: "continuum*fit"
 
 arc_lamp:
-  pattern: "lamp*fit"
+  pattern: "arclamp*fit"
   name: "HgAr_neon.dat"
 
 standard_star:
   pattern: "Feige66*fit"
   name: "Feige66"
-  dispersion: "485"
   combine: "mean"
 
 science_obj:
-  pattern: "1101+1102*fit"
-  name: "1101+1102"
-  dispersion: "465"
+  pattern: "science*fit"
+  name: "Science"
   xlim: "1500"
   combine: "mean"
 
